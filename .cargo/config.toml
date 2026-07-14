@@ -1,0 +1,6 @@
+# yara-x pulls in wasmtime, which compiles C (helpers.c). On this machine `cc`
+# doesn't find the macOS SDK headers by default, so point it at the SDK.
+# If Xcode moves or you use Command Line Tools, update this to
+# `xcrun --show-sdk-path` output (or delete this file if cc finds the SDK).
+[env]
+SDKROOT = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"

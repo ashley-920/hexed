@@ -1,0 +1,14 @@
+[package]
+name = "hexed-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# UI-agnostic core (no egui / windowing deps) so the future .bt engine and a
+# headless CLI can reuse it. Crypto crates for the hashing module are fine.
+[dependencies]
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+yara-x = "0.13"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "intel"] }

@@ -1,0 +1,16 @@
+// GIF — the header ("GIF" + version) and the Logical Screen Descriptor.
+// GIF is little-endian.
+LittleEndian();
+
+struct {
+    char signature[3];   // "GIF"
+    char version[3];     // "87a" or "89a"
+} header <bgcolor=cLtGreen>;
+
+struct {
+    uint16 width;
+    uint16 height;
+    ubyte  packed <format=hex>;
+    ubyte  backgroundColorIndex;
+    ubyte  pixelAspectRatio;
+} screenDescriptor <bgcolor=cLtBlue>;

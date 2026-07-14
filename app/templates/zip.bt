@@ -1,0 +1,19 @@
+// ZIP archive — the first local file header (PK\x03\x04) and its file name.
+// ZIP is little-endian.
+LittleEndian();
+
+struct {
+    char   signature[4] <bgcolor=cLtGreen>;   // "PK\x03\x04"
+    uint16 versionNeeded;
+    uint16 flags <format=hex>;
+    uint16 compressionMethod;
+    uint16 modTime <format=hex>;
+    uint16 modDate <format=hex>;
+    uint32 crc32 <format=hex>;
+    uint32 compressedSize;
+    uint32 uncompressedSize;
+    uint16 fileNameLength;
+    uint16 extraFieldLength;
+    char   fileName[fileNameLength] <bgcolor=cLtYellow>;
+    ubyte  extraField[extraFieldLength];
+} localFileHeader <bgcolor=cLtBlue>;

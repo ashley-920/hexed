@@ -1,0 +1,75 @@
+// PE / Portable Executable (EXE, DLL, SYS). Little-endian.
+// Parses the DOS header, the PE/COFF header, the start of the optional header
+// (entry point), and every section header. 010's classic use case.
+LittleEndian();
+
+struct {
+    char   e_magic[2] <bgcolor=cLtGreen>;   // "MZ"
+    uint16 e_cblp;
+    uint16 e_cp;
+    uint16 e_crlc;
+    uint16 e_cparhdr;
+    uint16 e_minalloc;
+    uint16 e_maxalloc;
+    uint16 e_ss;
+    uint16 e_sp;
+    uint16 e_csum;
+    uint16 e_ip;
+    uint16 e_cs;
+    uint16 e_lfarlc;
+    uint16 e_ovno;
+    uint16 e_res[4];
+    uint16 e_oemid;
+    uint16 e_oeminfo;
+    uint16 e_res2[10];
+    uint32 e_lfanew <format=hex>;            // file offset of the PE header
+} dosHeader <bgcolor=cLtBlue>;
+
+// Jump to the PE header.
+FSeek(dosHeader.e_lfanew);
+
+struct {
+    char   signature[4] <bgcolor=cLtGreen>;  // "PE\0\0"
+    uint16 machine <format=hex>;             // 0x14C=x86, 0x8664=x64, 0xAA64=ARM64
+    uint16 numberOfSections;
+    uint32 timeDateStamp;
+    uint32 pointerToSymbolTable <format=hex>;
+    uint32 numberOfSymbols;
+    uint16 sizeOfOptionalHeader;
+    uint16 characteristics <format=hex>;
+} peHeader <bgcolor=cLtYellow>;
+
+// The optional header's standard fields (identical layout for PE32 / PE32+).
+struct {
+    uint16 magic <format=hex>;               // 0x10B=PE32, 0x20B=PE32+
+    ubyte  majorLinkerVersion;
+    ubyte  minorLinkerVersion;
+    uint32 sizeOfCode <format=hex>;
+    uint32 sizeOfInitializedData <format=hex>;
+    uint32 sizeOfUninitializedData <format=hex>;
+    uint32 addressOfEntryPoint <format=hex>;
+    uint32 baseOfCode <format=hex>;
+} optionalHeader <bgcolor=cLtAqua>;
+
+// Seek past the whole optional header to the section table.
+local int64 sectionTableOffset =
+    dosHeader.e_lfanew + 24 + peHeader.sizeOfOptionalHeader;
+FSeek(sectionTableOffset);
+
+typedef struct {
+    char   name[8] <bgcolor=cLtGreen>;
+    uint32 virtualSize <format=hex>;
+    uint32 virtualAddress <format=hex>;
+    uint32 sizeOfRawData <format=hex>;
+    uint32 pointerToRawData <format=hex>;
+    uint32 pointerToRelocations <format=hex>;
+    uint32 pointerToLinenumbers <format=hex>;
+    uint16 numberOfRelocations;
+    uint16 numberOfLinenumbers;
+    uint32 characteristics <format=hex>;
+} SECTION <bgcolor=cLtBlue>;
+
+local int i;
+for (i = 0; i < peHeader.numberOfSections; i++) {
+    SECTION section;
+}

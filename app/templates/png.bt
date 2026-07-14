@@ -1,0 +1,16 @@
+// PNG image — the 8-byte signature followed by a chain of length-prefixed
+// chunks (IHDR, IDAT, …, IEND). PNG is big-endian.
+BigEndian();
+
+char signature[8] <bgcolor=cLtGreen>;
+
+typedef struct {
+    uint32 length;
+    char   ctype[4];
+    ubyte  data[length];
+    uint32 crc <format=hex>;
+} CHUNK <bgcolor=cLtBlue>;
+
+while (!FEof()) {
+    CHUNK chunk;
+}

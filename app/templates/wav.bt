@@ -1,0 +1,19 @@
+// WAV audio — the RIFF/WAVE header and the "fmt " chunk. RIFF is little-endian.
+LittleEndian();
+
+struct {
+    char   riff[4] <bgcolor=cLtGreen>;    // "RIFF"
+    uint32 fileSize;
+    char   wave[4];                        // "WAVE"
+} riffHeader <bgcolor=cLtBlue>;
+
+struct {
+    char   fmtId[4];                        // "fmt "
+    uint32 fmtSize;
+    uint16 audioFormat;                     // 1 = PCM
+    uint16 numChannels;
+    uint32 sampleRate;
+    uint32 byteRate;
+    uint16 blockAlign;
+    uint16 bitsPerSample;
+} fmtChunk <bgcolor=cLtYellow>;

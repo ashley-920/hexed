@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/hexed-core", "crates/hexed-bt", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["hexed contributors"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

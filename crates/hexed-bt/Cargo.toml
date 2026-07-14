@@ -1,0 +1,9 @@
+[package]
+name = "hexed-bt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The .bt (010-compatible binary template) engine: lexer -> parser -> interpreter.
+# Pure logic, no dependencies.
+[dependencies]

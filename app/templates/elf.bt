@@ -1,0 +1,40 @@
+// ELF executable header. The e_ident block declares class (32/64-bit) and
+// endianness; the rest of the header is laid out accordingly.
+LittleEndian();
+
+struct {
+    char  magic[4] <bgcolor=cLtGreen>;   // 7F 'E' 'L' 'F'
+    ubyte ei_class;                       // 1 = 32-bit, 2 = 64-bit
+    ubyte ei_data;                        // 1 = little-endian, 2 = big-endian
+    ubyte ei_version;
+    ubyte ei_osabi;
+    ubyte ei_abiversion;
+    ubyte ei_pad[7];
+} e_ident <bgcolor=cLtBlue>;
+
+if (e_ident.ei_data == 2)
+    BigEndian();
+
+local int is64 = (e_ident.ei_class == 2);
+
+uint16 e_type;
+uint16 e_machine;
+uint32 e_version;
+
+if (is64) {
+    uint64 e_entry <format=hex>;
+    uint64 e_phoff;
+    uint64 e_shoff;
+} else {
+    uint32 e_entry <format=hex>;
+    uint32 e_phoff;
+    uint32 e_shoff;
+}
+
+uint32 e_flags <format=hex>;
+uint16 e_ehsize;
+uint16 e_phentsize;
+uint16 e_phnum;
+uint16 e_shentsize;
+uint16 e_shnum;
+uint16 e_shstrndx;

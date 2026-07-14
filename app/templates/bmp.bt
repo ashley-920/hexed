@@ -1,0 +1,25 @@
+// Windows BMP — the BITMAPFILEHEADER followed by the BITMAPINFOHEADER.
+// BMP is little-endian.
+LittleEndian();
+
+struct {
+    char   magic[2] <bgcolor=cLtGreen>;   // "BM"
+    uint32 fileSize <format=hex>;
+    uint16 reserved1;
+    uint16 reserved2;
+    uint32 dataOffset <format=hex>;
+} fileHeader <bgcolor=cLtBlue>;
+
+struct {
+    uint32 headerSize;
+    int32  width;
+    int32  height;
+    uint16 planes;
+    uint16 bitsPerPixel;
+    uint32 compression;
+    uint32 imageSize;
+    int32  xPixelsPerMeter;
+    int32  yPixelsPerMeter;
+    uint32 colorsUsed;
+    uint32 importantColors;
+} infoHeader <bgcolor=cLtYellow>;

@@ -1,0 +1,36 @@
+[package]
+name = "hexed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hexed"
+path = "src/main.rs"
+
+[dependencies]
+hexed-core = { path = "../crates/hexed-core" }
+hexed-bt = { path = "../crates/hexed-bt" }
+eframe = "0.31"
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png", "ico", "bmp"] }
+# VirusTotal hash-reputation lookups (opt-in, by-hash only).
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
+# macOS "Open With" (Finder Apple Events). Pinned to the same objc2 the winit in
+# eframe uses, so no duplicate objc2 enters the build.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", features = [
+    "NSAppleEventManager",
+    "NSAppleEventDescriptor",
+    "NSString",
+    "NSURL",
+] }
+objc2-app-kit = { version = "0.2.2", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSWindow",
+    "NSAppearance",
+] }
