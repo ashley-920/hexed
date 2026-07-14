@@ -261,9 +261,17 @@ struct Document {
     yara_lib_errors: Vec<(String, String)>,
     /// SHA-256 of the whole file (cached; used for VirusTotal lookups).
     file_sha256: String,
-    /// Byte offset of each line start, for the virtualized text view (computed
-    /// lazily when the text view is first shown; cleared on edit).
-    line_starts: Vec<usize>,
+    /// Editable text-view buffer (the file decoded as UTF-8-lossy). Refreshed
+    /// from `buffer` when `text_valid` is false (i.e. after an out-of-view edit).
+    text_buf: String,
+    /// Whether `text_buf` reflects the current byte buffer.
+    text_valid: bool,
+    /// Whether `text_buf` has edits not yet committed to the byte buffer.
+    text_dirty: bool,
+    /// Which nibble the hex-edit caret is on (false = high, true = low).
+    hex_low_nibble: bool,
+    /// Whether hex-view typing edits the ASCII pane (true) or hex pane (false).
+    edit_ascii: bool,
 }
 
 impl Document {
@@ -307,7 +315,11 @@ impl Document {
             yara_lib_matches: Vec::new(),
             yara_lib_errors: Vec::new(),
             file_sha256: String::new(),
-            line_starts: Vec::new(),
+            text_buf: String::new(),
+            text_valid: false,
+            text_dirty: false,
+            hex_low_nibble: false,
+            edit_ascii: false,
         }
     }
 
@@ -339,26 +351,7 @@ fn invalidate_derived(d: &mut Document) {
     d.diff_summary = None;
     d.bt_spans.clear();
     d.bt_result = None;
-    d.line_starts.clear();
-}
-
-/// Byte offset of the start of each line (split on `\n`), for the text view.
-fn compute_line_starts(data: &[u8]) -> Vec<usize> {
-    let mut starts = vec![0usize];
-    for (i, &b) in data.iter().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    starts
-}
-
-/// Line index containing byte offset `off` (binary search over line starts).
-fn line_of(starts: &[usize], off: usize) -> usize {
-    match starts.binary_search(&off) {
-        Ok(i) => i,
-        Err(i) => i.saturating_sub(1),
-    }
+    d.text_valid = false;
 }
 
 struct HexedApp {
@@ -956,7 +949,11 @@ impl eframe::App for HexedApp {
         let mut action_about = false;
         let mut action_set_theme: Option<Theme> = None;
         // Don't hijack ⌘A / shortcuts while a text field (Find, key, …) is focused.
-        let typing = ctx.memory(|m| m.focused().is_some());
+        // The hex grid is also focusable (for byte-editing) but is NOT a text
+        // field, so exclude it — otherwise clicking the grid would disable ⌘A.
+        let typing = ctx.memory(|m| {
+            m.focused().is_some_and(|id| id != egui::Id::new(HEX_GRID_ID))
+        });
         ctx.input(|i| {
             if i.modifiers.command {
                 if i.key_pressed(egui::Key::O) {
@@ -3036,6 +3033,9 @@ impl eframe::App for HexedApp {
         self.disasm_bits = disasm_bits;
         self.bytes_per_row = bytes_per_row;
         if view_mode != self.view {
+            if self.view == ViewMode::Text {
+                self.commit_text(self.active); // leaving text view: flush edits
+            }
             save_view(view_mode);
         }
         self.view = view_mode;
@@ -3418,14 +3418,6 @@ impl eframe::App for HexedApp {
             });
 
         // ---- central pane: hex grid or text view ----
-        if self.view == ViewMode::Text {
-            // Lazily index line starts the first time the text view is shown.
-            if let Some(d) = self.docs.get_mut(a) {
-                if d.line_starts.is_empty() && !d.buffer.data().is_empty() {
-                    d.line_starts = compute_line_starts(d.buffer.data());
-                }
-            }
-        }
         let (hex_action, carve) = egui::CentralPanel::default()
             .show(ctx, |ui| {
                 if self.view == ViewMode::Text {
@@ -3627,6 +3619,7 @@ impl eframe::App for HexedApp {
             self.open_path(path);
         }
         if action_save {
+            self.commit_text(a); // flush any pending text-view edits first
             let mut st = None;
             if let Some(d) = self.docs.get_mut(a) {
                 st = Some(match d.buffer.save() {
@@ -3744,6 +3737,7 @@ impl eframe::App for HexedApp {
             }
         }
         if action_save_as {
+            self.commit_text(a); // flush any pending text-view edits first
             if let Some(path) = rfd::FileDialog::new().save_file() {
                 let mut st = None;
                 if let Some(d) = self.docs.get_mut(a) {
@@ -4265,115 +4259,99 @@ impl HexedApp {
         s
     }
 
-    /// Draw the active document's virtualized hex/ASCII grid. Takes `&self`
-    /// only; returns a selection change for the caller to apply.
-    /// Text view: the file rendered as lines (split on `\n`) with a byte-offset
-    /// gutter, virtualized like the hex grid. Clicking a line places the caret at
-    /// its start (kept in sync with the hex view). Long lines are truncated.
-    fn draw_text(&self, ui: &mut egui::Ui) -> (Option<SelUpdate>, Option<(usize, Vec<u8>)>) {
-        let Some(doc) = self.docs.get(self.active) else {
-            ui.centered_and_justified(|ui| {
-                ui.label("Open a file (Ctrl+O) or drop one onto the window.");
-            });
-            return (None, None);
+    /// Text view: the file decoded as UTF-8-lossy text in a **wrapping, editable**
+    /// multiline editor. Edits are committed back to the byte buffer as one
+    /// undoable change when the field loses focus (or on save). Binary
+    /// (non-UTF-8) or large files are read-only to avoid corruption / lag.
+    fn draw_text(&mut self, ui: &mut egui::Ui) -> (Option<SelUpdate>, Option<(usize, Vec<u8>)>) {
+        const EDIT_LIMIT: usize = 1024 * 1024;
+        let active = self.active;
+        let (len, editable) = match self.docs.get(active) {
+            None => {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Open a file (Ctrl+O) or drop one onto the window.");
+                });
+                return (None, None);
+            }
+            Some(d) => (d.buffer.len(), std::str::from_utf8(d.buffer.data()).is_ok()),
         };
-        let data = doc.buffer.data();
-        let len = data.len();
         if len == 0 {
             ui.label("(empty file)");
             return (None, None);
         }
-        let font = FontId::monospace(14.0);
-        let char_w = ui.fonts(|f| f.glyph_width(&font, '0')).max(7.0);
-        let row_h = ui.fonts(|f| f.row_height(&font)).max(15.0);
-        let lines = &doc.line_starts;
-        let num_lines = lines.len().max(1);
-        let gutter = 9.0 * char_w; // "XXXXXXXX " offset column
-        let content_h = num_lines as f32 * row_h;
-        let sel = doc.selection_range();
-        let sel_color = self.palette.sel;
-        let avail_w = ui.available_width().max(200.0);
-        const MAXC: usize = 1024; // painted chars per line (truncate binary blobs)
+        if len > EDIT_LIMIT {
+            ui.label(
+                egui::RichText::new(format!(
+                    "File is {:.1} MB — too large for the text view; use the Hex view.",
+                    len as f64 / (1024.0 * 1024.0)
+                ))
+                .weak(),
+            );
+            return (None, None);
+        }
+        // Rebuild the text buffer from bytes unless we hold uncommitted edits.
+        if let Some(d) = self.docs.get_mut(active) {
+            if !d.text_valid && !d.text_dirty {
+                d.text_buf = String::from_utf8_lossy(d.buffer.data()).into_owned();
+                d.text_valid = true;
+            }
+        }
+        if !editable {
+            ui.label(
+                egui::RichText::new("binary data — read-only here; edit the bytes in the Hex view")
+                    .color(self.palette.warn)
+                    .size(11.0),
+            );
+            ui.add_space(2.0);
+        }
 
-        let mut result: Option<SelUpdate> = None;
+        let mut changed = false;
+        let mut lost_focus = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let (rect, response) =
-                    ui.allocate_exact_size(vec2(avail_w, content_h), Sense::click());
-                let ox = rect.left();
-                let content_top = rect.top();
-
-                if let Some(off) = doc.scroll_to {
-                    let li = line_of(lines, off.min(len));
-                    let ty = content_top + li as f32 * row_h;
-                    ui.scroll_to_rect(
-                        Rect::from_min_size(pos2(ox, ty), vec2(avail_w, row_h)),
-                        Some(egui::Align::Center),
+                if let Some(d) = self.docs.get_mut(active) {
+                    let r = ui.add(
+                        egui::TextEdit::multiline(&mut d.text_buf)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(30)
+                            .interactive(editable),
                     );
-                }
-
-                let clip = ui.clip_rect();
-                let first = (((clip.top() - content_top) / row_h).floor().max(0.0)) as usize;
-                let last = ((((clip.bottom() - content_top) / row_h).ceil()).max(0.0) as usize)
-                    .min(num_lines);
-                let painter = ui.painter_at(clip);
-
-                for li in first..last {
-                    let y = content_top + li as f32 * row_h;
-                    let start = lines[li];
-                    let end = if li + 1 < lines.len() { lines[li + 1] } else { len };
-                    let mut e = end;
-                    while e > start && (data[e - 1] == b'\n' || data[e - 1] == b'\r') {
-                        e -= 1;
-                    }
-                    let raw = &data[start..e];
-                    if let Some((ss, se)) = sel {
-                        if se > start && ss < end {
-                            painter.rect_filled(
-                                Rect::from_min_size(pos2(ox, y), vec2(avail_w, row_h)),
-                                0.0,
-                                sel_color,
-                            );
-                        }
-                    }
-                    painter.text(
-                        pos2(ox + 4.0, y),
-                        Align2::LEFT_TOP,
-                        format!("{start:08X}"),
-                        font.clone(),
-                        self.palette.faint,
-                    );
-                    let mut disp = String::with_capacity(raw.len().min(MAXC));
-                    for &b in raw.iter().take(MAXC) {
-                        disp.push(match b {
-                            0x20..=0x7e => b as char,
-                            b'\t' => ' ',
-                            _ => '.',
-                        });
-                    }
-                    painter.text(
-                        pos2(ox + gutter, y),
-                        Align2::LEFT_TOP,
-                        disp,
-                        font.clone(),
-                        self.palette.text,
-                    );
-                }
-
-                if response.clicked() {
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        let li = (((pos.y - content_top) / row_h).floor().max(0.0) as usize)
-                            .min(num_lines - 1);
-                        result = Some(SelUpdate::Set(lines[li]));
-                    }
+                    changed = r.changed();
+                    lost_focus = r.lost_focus();
                 }
             });
-        (result, None)
+
+        if editable {
+            if changed {
+                if let Some(d) = self.docs.get_mut(active) {
+                    d.text_dirty = true;
+                }
+            }
+            if lost_focus {
+                self.commit_text(active);
+            }
+        }
+        (None, None)
     }
 
-    fn draw_hex(&self, ui: &mut egui::Ui) -> (Option<SelUpdate>, Option<(usize, Vec<u8>)>) {
-        let Some(doc) = self.docs.get(self.active) else {
+    /// Flush pending text-view edits into the byte buffer as one undoable change.
+    fn commit_text(&mut self, active: usize) {
+        if let Some(d) = self.docs.get_mut(active) {
+            if d.text_dirty {
+                let bytes = d.text_buf.clone().into_bytes();
+                d.buffer.replace_all(bytes);
+                d.text_dirty = false;
+                invalidate_derived(d);
+                d.text_valid = true; // text_buf already matches the buffer
+            }
+        }
+    }
+
+    fn draw_hex(&mut self, ui: &mut egui::Ui) -> (Option<SelUpdate>, Option<(usize, Vec<u8>)>) {
+        let active = self.active;
+        let Some(doc) = self.docs.get(active) else {
             ui.centered_and_justified(|ui| {
                 ui.label("Open a file (Ctrl+O) or drop one onto the window.");
             });
@@ -4385,6 +4363,10 @@ impl HexedApp {
             ui.label("(empty file)");
             return (None, None);
         }
+        // Edit-caret state snapshotted for this frame (byte-editing, 010-style).
+        let caret0 = doc.sel_cursor.map(|c| c.min(len - 1));
+        let low0 = doc.hex_low_nibble;
+        let ascii0 = doc.edit_ascii;
         let font = FontId::monospace(14.0);
         let char_w = ui.fonts(|f| f.glyph_width(&font, '0')).max(7.0);
         let row_h = ui.fonts(|f| f.row_height(&font)).max(15.0);
@@ -4411,6 +4393,12 @@ impl HexedApp {
         let mut result: Option<SelUpdate> = None;
         // Bytes to carve into a new tab (start offset, bytes), set from the menu.
         let mut carve: Option<(usize, Vec<u8>)> = None;
+        // Byte edits typed this frame, and the resulting caret/nibble/pane state.
+        let mut edits: Vec<(usize, u8)> = Vec::new();
+        let mut new_caret: Option<usize> = None;
+        let mut new_low: Option<bool> = None;
+        let mut new_ascii: Option<bool> = None;
+        let mut scroll_follow: Option<usize> = None;
 
         let content_h = num_rows as f32 * row_h;
 
@@ -4418,9 +4406,12 @@ impl HexedApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // Reserve the full virtual content height (this sets the scroll
-                // range) and take one response over it for hit-testing.
-                let (rect, response) =
-                    ui.allocate_exact_size(vec2(total_w, content_h), Sense::click_and_drag());
+                // range) and take one response over it for hit-testing. Use a
+                // stable id so keyboard focus (for byte-editing) is identifiable.
+                let (rect, _) =
+                    ui.allocate_exact_size(vec2(total_w, content_h), Sense::hover());
+                let response =
+                    ui.interact(rect, egui::Id::new(HEX_GRID_ID), Sense::click_and_drag());
                 let ox = rect.left();
                 let content_top = rect.top();
 
@@ -4554,8 +4545,102 @@ impl HexedApp {
                     let idx = (row * bpr + col).min(len - 1);
                     if response.drag_started_by(egui::PointerButton::Primary) || response.clicked() {
                         result = Some(SelUpdate::Set(idx));
+                        // Place the edit caret here: pick the clicked pane, reset
+                        // to the high nibble, and take keyboard focus for typing.
+                        new_ascii = Some(rel_x >= x_ascii);
+                        new_low = Some(false);
+                        response.request_focus();
                     } else if response.dragged_by(egui::PointerButton::Primary) {
                         result = Some(SelUpdate::Extend(idx));
+                    }
+                }
+
+                // ---- keyboard byte-editing (010-style) when the grid is focused ----
+                if response.has_focus() {
+                    let mut cur = caret0.unwrap_or(0);
+                    let mut low = low0;
+                    let mut moved = false;
+                    let events = ui.input(|i| i.events.clone());
+                    for ev in &events {
+                        match ev {
+                            egui::Event::Text(t) => {
+                                for ch in t.chars() {
+                                    if ascii0 {
+                                        if (' '..='~').contains(&ch) {
+                                            edits.push((cur, ch as u8));
+                                            if cur + 1 < len {
+                                                cur += 1;
+                                            }
+                                            moved = true;
+                                        }
+                                    } else if let Some(hd) = ch.to_digit(16) {
+                                        let base = latest_byte(&edits, cur, data);
+                                        if !low {
+                                            edits.push((cur, (base & 0x0F) | ((hd as u8) << 4)));
+                                            low = true;
+                                        } else {
+                                            edits.push((cur, (base & 0xF0) | hd as u8));
+                                            low = false;
+                                            if cur + 1 < len {
+                                                cur += 1;
+                                            }
+                                        }
+                                        moved = true;
+                                    }
+                                }
+                            }
+                            egui::Event::Key { key, pressed: true, .. } => {
+                                let step = match key {
+                                    egui::Key::ArrowRight => 1i64,
+                                    egui::Key::ArrowLeft => -1,
+                                    egui::Key::ArrowDown => bpr as i64,
+                                    egui::Key::ArrowUp => -(bpr as i64),
+                                    _ => 0,
+                                };
+                                if step != 0 {
+                                    cur = (cur as i64 + step).clamp(0, len as i64 - 1) as usize;
+                                    low = false;
+                                    moved = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if moved {
+                        new_caret = Some(cur);
+                        new_low = Some(low);
+                        let cr = cur / bpr;
+                        if cr < first || cr >= last {
+                            scroll_follow = Some(cur); // caret left the viewport
+                        }
+                    }
+                }
+
+                // ---- caret marker (outline the byte being edited) ----
+                if response.has_focus() {
+                    if let Some(ci) = new_caret.or(caret0) {
+                        let row = ci / bpr;
+                        let col = ci % bpr;
+                        let y = content_top + row as f32 * row_h;
+                        let active_pane_ascii = new_ascii.unwrap_or(ascii0);
+                        let hx = ox + x_hex + col as f32 * byte_w;
+                        let ax = ox + x_ascii + col as f32 * char_w;
+                        let hex_rect = Rect::from_min_size(pos2(hx - 1.0, y), vec2(byte_w, row_h));
+                        let asc_rect = Rect::from_min_size(pos2(ax - 1.0, y), vec2(char_w + 1.0, row_h));
+                        let strong = egui::Stroke::new(1.5, self.palette.accent);
+                        let faint = egui::Stroke::new(1.0, self.palette.faint);
+                        painter.rect_stroke(
+                            hex_rect,
+                            1.0,
+                            if active_pane_ascii { faint } else { strong },
+                            egui::StrokeKind::Inside,
+                        );
+                        painter.rect_stroke(
+                            asc_rect,
+                            1.0,
+                            if active_pane_ascii { strong } else { faint },
+                            egui::StrokeKind::Inside,
+                        );
                     }
                 }
 
@@ -4611,8 +4696,46 @@ impl HexedApp {
                 });
             });
 
+        // Apply the frame's byte edits + caret/nibble/pane changes to the doc.
+        if let Some(d) = self.docs.get_mut(active) {
+            if !edits.is_empty() {
+                for (off, b) in &edits {
+                    d.buffer.overwrite(*off, &[*b]);
+                }
+                // Length is unchanged, so offset-based state stays valid; just
+                // mark the byte-derived views stale (a full re-scan every
+                // keystroke would be too costly — it refreshes on save/reopen).
+                d.strings_dirty = true;
+                d.text_valid = false;
+            }
+            if let Some(c) = new_caret {
+                d.sel_anchor = Some(c);
+                d.sel_cursor = Some(c);
+            }
+            if let Some(l) = new_low {
+                d.hex_low_nibble = l;
+            }
+            if let Some(a2) = new_ascii {
+                d.edit_ascii = a2;
+            }
+            if let Some(off) = scroll_follow {
+                d.scroll_to = Some(off);
+                d.scroll_ttl = 4;
+            }
+        }
+
         (result, carve)
     }
+}
+
+/// Stable egui id for the hex grid's interaction/focus target, so the keyboard
+/// handler can tell "editing bytes in the grid" from "typing in a text field".
+const HEX_GRID_ID: &str = "hexed_hex_grid";
+
+/// The latest value of the byte at `off` given edits queued this frame (so the
+/// second hex nibble sees the first). Falls back to the buffer's current byte.
+fn latest_byte(edits: &[(usize, u8)], off: usize, data: &[u8]) -> u8 {
+    edits.iter().rev().find(|(o, _)| *o == off).map(|(_, b)| *b).unwrap_or(data[off])
 }
 
 /// Render one `.bt` results-tree node. Leaves are clickable (jump to their

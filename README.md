@@ -77,7 +77,7 @@ Running the built‑in report over the bundled [`examples/demo_triage.bin`](exam
 
 **Viewing & navigation**
 - Virtualized hex + ASCII grid (opens multi‑hundred‑MB files instantly), byte‑value colour coding, **4 switchable themes**, and a launch splash
-- **Hex / Text view toggle** — flip the central pane between the hex grid and a line‑based **text view** (byte‑offset gutter, click a line to place the caret), like 010 Editor
+- **Hex / Text view toggle** — flip the central pane between the hex grid and a **text view**, like 010 Editor. Both are **editable**: type hex digits (or ASCII) straight into the grid to overwrite bytes, or edit the file as **word‑wrapped, editable text** — changes commit back to the buffer as one undoable step. Non‑UTF‑8 files stay read‑only in text mode so binaries can't be mangled
 - **Tabs** — many files at once; each keeps its own selection, strings, hashes, search, and decode state; drag‑and‑drop to open
 - **Entropy strip** down the gutter (blue → red) to spot packed/encrypted regions at a glance
 - **Search** — hex pattern with `??` wildcards or text; **Goto (⌘G)**; click any string, IOC, section, or signature to jump to it
@@ -86,7 +86,7 @@ Running the built‑in report over the bundled [`examples/demo_triage.bin`](exam
 - **XOR** with a repeating hex/ASCII key and a **live decode preview** — strings fall out as you type the key
 - **Single‑byte brute force** — ranks all 256 keys by how much the output looks like text
 - **Block transforms** (undoable): NOT, NEG, +1, −1, ROL, ROR, Reverse, ByteSwap16/32
-- Insert/delete/resize with unlimited undo/redo
+- **Type‑to‑edit** — overwrite bytes by typing hex or ASCII in the grid, or edit the file as text; insert/delete/resize; all with unlimited undo/redo
 
 **Structure & analysis**
 - **Data inspector** — int/uint 8–64, float32/64, `time_t`, Windows `FILETIME`, LE/BE, multi‑base converter

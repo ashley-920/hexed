@@ -62,7 +62,7 @@ ${ICON_PLIST}
             <key>CFBundleTypeName</key><string>Any file</string>
             <key>CFBundleTypeRole</key><string>Viewer</string>
             <key>LSHandlerRank</key><string>Alternate</string>
-            <!-- Cover every file. `public.executable` must be listed explicitly:
+            <!-- Cover every file. public.executable must be listed explicitly:
                  macOS special-cases executables (.exe/.dll/Mach-O) and refuses a
                  generic public.data-only handler at open time even though it lists
                  it in the menu. public.content/data/item cover documents & blobs. -->

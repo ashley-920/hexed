@@ -19,6 +19,8 @@ enum Edit {
     Insert { offset: usize, bytes: Vec<u8> },
     /// Remove `len` bytes at `offset` (shrinks the buffer).
     Delete { offset: usize, len: usize },
+    /// Replace the entire buffer with `bytes` (used by the text editor).
+    Replace { bytes: Vec<u8> },
 }
 
 pub struct Buffer {
@@ -129,7 +131,23 @@ impl Buffer {
                     self.data.splice(offset..end, std::iter::empty()).collect();
                 Edit::Insert { offset, bytes: removed }
             }
+            Edit::Replace { bytes } => {
+                let old = std::mem::replace(&mut self.data, bytes);
+                Edit::Replace { bytes: old }
+            }
         }
+    }
+
+    /// Replace the entire buffer contents (used by the text editor), recording a
+    /// single undo entry for the whole change.
+    pub fn replace_all(&mut self, new: Vec<u8>) {
+        if new == self.data {
+            return;
+        }
+        let old = std::mem::replace(&mut self.data, new);
+        self.undo.push(Edit::Replace { bytes: old });
+        self.redo.clear();
+        self.dirty = true;
     }
 
     pub fn undo(&mut self) -> bool {
@@ -192,6 +210,22 @@ mod tests {
         assert_eq!(b.data(), &[0, 0xAA, 0xBB, 3, 4]);
 
         assert!(!b.redo());
+    }
+
+    #[test]
+    fn replace_all_undo_redo() {
+        let mut b = Buffer::from_bytes(vec![1, 2, 3]);
+        b.replace_all(b"hello world".to_vec());
+        assert_eq!(b.data(), b"hello world");
+        assert!(b.is_dirty());
+        assert!(b.undo());
+        assert_eq!(b.data(), &[1, 2, 3]);
+        assert!(b.redo());
+        assert_eq!(b.data(), b"hello world");
+        // no-op when unchanged: nothing recorded
+        let mut b2 = Buffer::from_bytes(b"same".to_vec());
+        b2.replace_all(b"same".to_vec());
+        assert!(!b2.undo());
     }
 
     #[test]
