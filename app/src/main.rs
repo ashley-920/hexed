@@ -144,6 +144,10 @@ fn set_dark_titlebar() {
 fn set_dark_titlebar() {}
 
 fn main() -> eframe::Result<()> {
+    // Register the macOS "Open With" ('odoc') handler FIRST — before eframe spins
+    // up NSApplication — so its willFinishLaunching observer is in place to catch
+    // a cold-launch document (delivered during app launch, before our UI exists).
+    openwith::install();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1180.0, 780.0])
         .with_min_inner_size([760.0, 480.0])
@@ -163,8 +167,8 @@ fn main() -> eframe::Result<()> {
             let mut app = HexedApp::default();
             install_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx, app.theme);
-            // Receive files opened via Finder "Open With" (macOS 'odoc' events).
-            openwith::install(&cc.egui_ctx);
+            // Wire egui so the (already-installed) 'odoc' handler can nudge repaints.
+            openwith::set_context(&cc.egui_ctx);
             // Darken the native macOS title bar to match the dark theme.
             set_dark_titlebar();
             for p in &initial_paths {

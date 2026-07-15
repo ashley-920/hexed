@@ -18,7 +18,9 @@ mod imp {
     use objc2::rc::Retained;
     use objc2::runtime::NSObject;
     use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
-    use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventManager, NSString, NSURL};
+    use objc2_foundation::{
+        NSAppleEventDescriptor, NSAppleEventManager, NSNotificationCenter, NSString, NSURL,
+    };
 
     /// Files delivered by 'odoc' events, waiting to be opened by the UI.
     static PENDING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -50,8 +52,31 @@ mod imp {
             ) {
                 unsafe { collect_paths(event) };
             }
+
+            // Invoked from NSApplicationWillFinishLaunchingNotification — the
+            // Apple-recommended point to (re)install AE handlers so ours overrides
+            // AppKit's default in time for a cold-launch "Open With" document.
+            #[method(installOdocHandler:)]
+            fn install_odoc_handler(&self, _notification: &NSObject) {
+                unsafe { register_odoc(self) };
+            }
         }
     );
+
+    /// Point the shared Apple Event manager's 'odoc' handler at `handler`.
+    unsafe fn register_odoc(handler: &AeHandler) {
+        const K_CORE_EVENT_CLASS: u32 = fourcc(b"aevt");
+        const K_AE_OPEN_DOCUMENTS: u32 = fourcc(b"odoc");
+        let mgr = NSAppleEventManager::sharedAppleEventManager();
+        let selector = sel!(handleAppleEvent:withReplyEvent:);
+        let _: () = msg_send![
+            &mgr,
+            setEventHandler: handler,
+            andSelector: selector,
+            forEventClass: K_CORE_EVENT_CLASS,
+            andEventID: K_AE_OPEN_DOCUMENTS,
+        ];
+    }
 
     /// Extract file paths from an 'odoc' Apple Event's direct object and queue
     /// them, then nudge the UI to repaint so it drains the queue promptly.
@@ -95,32 +120,44 @@ mod imp {
         Some(PathBuf::from(path.to_string()))
     }
 
-    /// Register the 'odoc' handler with the shared Apple Event manager. Safe to
-    /// call once, early on the main thread (e.g. the eframe creation closure).
-    pub fn install(ctx: &egui::Context) {
+    /// Register the 'odoc' handler. Call once, early on the main thread — ideally
+    /// the FIRST thing in `main()`, before `eframe::run_native`, so the
+    /// willFinishLaunching observer is in place for a cold-launch document.
+    /// [`set_context`] wires the repaint nudge once egui exists.
+    pub fn install() {
         static INSTALLED: OnceLock<()> = OnceLock::new();
         if INSTALLED.set(()).is_err() {
             return; // already installed
         }
-        let _ = CTX.set(ctx.clone());
-
-        const K_CORE_EVENT_CLASS: u32 = fourcc(b"aevt");
-        const K_AE_OPEN_DOCUMENTS: u32 = fourcc(b"odoc");
         unsafe {
             let handler: Retained<AeHandler> = msg_send_id![AeHandler::class(), new];
-            let mgr = NSAppleEventManager::sharedAppleEventManager();
-            let selector = sel!(handleAppleEvent:withReplyEvent:);
+            // Install now for the already-running / late-launch case...
+            register_odoc(&handler);
+            // ...and again at applicationWillFinishLaunching, which fires during a
+            // cold launch AFTER AppKit installs its own default 'odoc' handler but
+            // BEFORE the launch document is delivered — so ours wins and the file
+            // actually opens instead of erroring "cannot open files in the X
+            // format". (Installing only in the eframe setup closure races the
+            // launch event and loses it about half the time.)
+            let center = NSNotificationCenter::defaultCenter();
+            let name = NSString::from_str("NSApplicationWillFinishLaunchingNotification");
             let _: () = msg_send![
-                &mgr,
-                setEventHandler: &*handler,
-                andSelector: selector,
-                forEventClass: K_CORE_EVENT_CLASS,
-                andEventID: K_AE_OPEN_DOCUMENTS,
+                &center,
+                addObserver: &*handler,
+                selector: sel!(installOdocHandler:),
+                name: &*name,
+                object: Option::<&NSObject>::None,
             ];
-            // The manager keeps only a weak reference — leak the handler so it
-            // lives for the whole process.
+            // Both the AE manager and the notification center keep only weak
+            // references — leak the handler so it lives for the whole process.
             std::mem::forget(handler);
         }
+    }
+
+    /// Wire the egui context so the handler can nudge a repaint when a file
+    /// arrives. Optional: the UI also drains the queue every frame regardless.
+    pub fn set_context(ctx: &egui::Context) {
+        let _ = CTX.set(ctx.clone());
     }
 
     /// Take any files delivered since the last call (drains the queue).
@@ -133,10 +170,13 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{install, take_pending};
+pub use imp::{install, set_context, take_pending};
 
 #[cfg(not(target_os = "macos"))]
-pub fn install(_ctx: &eframe::egui::Context) {}
+pub fn install() {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_context(_ctx: &eframe::egui::Context) {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn take_pending() -> Vec<std::path::PathBuf> {
