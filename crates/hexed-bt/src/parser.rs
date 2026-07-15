@@ -18,8 +18,16 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+/// Max recursion depth for the expression/statement parser. A `.bt` template is
+/// untrusted (opened files, AI-generated), and this is a plain recursive-descent
+/// parser: without a cap, deep nesting (`((((…))))`, `!!!!…`, `{{{{…}}}}`)
+/// overflows the thread stack, which in Rust is an uncatchable process ABORT.
+/// A few hundred is far more nesting than any real template and stays well under
+/// the ~1500–2000 that overflows an 8 MB stack.
+const MAX_PARSE_DEPTH: u32 = 256;
+
 pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
-    let mut p = Parser { toks: tokens, pos: 0 };
+    let mut p = Parser { toks: tokens, pos: 0, depth: 0 };
     let mut items = Vec::new();
     while !p.at_eof() {
         items.push(p.parse_stmt()?);
@@ -30,6 +38,10 @@ pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
+    /// Current recursion depth of the expression/statement parser (see
+    /// [`MAX_PARSE_DEPTH`]); incremented on entry to the recursive gateways and
+    /// decremented on exit.
+    depth: u32,
 }
 
 fn bin_prec(op: &str) -> Option<u8> {
@@ -106,7 +118,21 @@ impl<'a> Parser<'a> {
     }
 
     // ---- statements ----
+    // Depth-guarded gateway for nested statements (blocks, if/for/while bodies,
+    // nested struct/union definitions), so deep block nesting can't overflow the
+    // stack (see [`MAX_PARSE_DEPTH`]).
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return self.err("statements nested too deeply");
+        }
+        let r = self.parse_stmt_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, ParseError> {
         if self.at_kw("if") {
             return self.parse_if();
         }
@@ -444,7 +470,21 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
+    // Depth-guarded gateway for ALL expression recursion: parens, prefix chains,
+    // ternary/assignment right-recursion, and binary operands every pass through
+    // here, so one cap bounds the whole expression tree.
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return self.err("expression nested too deeply");
+        }
+        let r = self.parse_unary_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, ParseError> {
         if let Some(TokKind::Punct(op)) = self.kind_at(0) {
             if matches!(*op, "!" | "~" | "-" | "+" | "++" | "--") {
                 let op = *op;

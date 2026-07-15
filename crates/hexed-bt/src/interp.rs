@@ -147,10 +147,19 @@ struct Interp<'a> {
     /// Loop-iteration budget — a template runs on the UI thread, so a
     /// non-advancing `while (!FEof())` must never hang the app.
     steps: u64,
+    /// Current type-expansion recursion depth (structs within structs / arrays),
+    /// bounded by [`MAX_TYPE_DEPTH`] so a self-referential struct can't overflow
+    /// the stack (an uncatchable process abort).
+    depth: u32,
 }
 
 /// Ceiling on total loop iterations across one run.
 const STEP_BUDGET: u64 = 10_000_000;
+
+/// Max nesting depth when expanding a type (struct/array) against the data. A
+/// self-referential or mutually-recursive struct that consumes no bytes would
+/// otherwise recurse until the thread stack aborts the process.
+const MAX_TYPE_DEPTH: u32 = 256;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -173,6 +182,7 @@ impl<'a> Interp<'a> {
             funcs: HashMap::new(),
             log: String::new(),
             steps: 0,
+            depth: 0,
         }
     }
 
@@ -446,8 +456,19 @@ impl<'a> Interp<'a> {
         let mut vals = Vec::new();
         let expand = !matches!(ty, TypeRef::Named(n) if builtin_type(&self.resolve_alias(n)).is_some());
         for i in 0..count {
+            self.guard_progress()?; // charge each element against the loop budget
+            let elem_start = self.pos;
             let elem_name = format!("{name}[{i}]");
             let (child, val) = self.read_type(ty, &elem_name, attrs)?;
+            // A zero-width element (empty struct, or a struct whose fields all
+            // sit at fixed positions) never advances the cursor, so a large
+            // `count` would allocate `count` identical empty nodes and OOM/hang.
+            // EOF can't stop it because nothing is read. Refuse it.
+            if self.pos == elem_start && i >= 1 {
+                return self.err(format!(
+                    "array `{name}` element is zero-width; refusing to read {count} of them"
+                ));
+            }
             vals.push(val);
             if expand {
                 children.push(child);
@@ -468,6 +489,25 @@ impl<'a> Interp<'a> {
     }
 
     fn read_type(
+        &mut self,
+        ty: &TypeRef,
+        name: &str,
+        attrs: &Attrs,
+    ) -> Result<(Node, Value), RunError> {
+        // Depth-guard every type expansion: a self-referential struct (e.g.
+        // `struct A { A next; };`) that consumes no bytes would otherwise recurse
+        // until the stack aborts the whole process.
+        self.depth += 1;
+        if self.depth > MAX_TYPE_DEPTH {
+            self.depth -= 1;
+            return self.err(format!("type `{name}` nested too deeply (recursive struct?)"));
+        }
+        let r = self.read_type_inner(ty, name, attrs);
+        self.depth -= 1;
+        r
+    }
+
+    fn read_type_inner(
         &mut self,
         ty: &TypeRef,
         name: &str,
@@ -734,7 +774,7 @@ impl<'a> Interp<'a> {
             // Only meaningful on an lvalue identifier.
             if let Expr::Ident(name) = expr {
                 let old = self.lookup(name).cloned().unwrap_or(Value::Int(0)).as_i64();
-                let new = if op == "++" { old + 1 } else { old - 1 };
+                let new = if op == "++" { old.wrapping_add(1) } else { old.wrapping_sub(1) };
                 self.assign(name, Value::Int(new));
                 return Ok(Value::Int(if prefix { new } else { old }));
             }
@@ -746,7 +786,8 @@ impl<'a> Interp<'a> {
             "~" => Value::Int(!v.as_i64()),
             "-" => match v {
                 Value::Float(f) => Value::Float(-f),
-                _ => Value::Int(-v.as_i64()),
+                // wrapping_neg: plain `-i64::MIN` overflow-panics.
+                _ => Value::Int(v.as_i64().wrapping_neg()),
             },
             "+" => v,
             _ => v,
@@ -931,10 +972,15 @@ impl<'a> Interp<'a> {
                 let p1 = args.first().map(|v| v.as_i64() as usize).unwrap_or(0);
                 let p2 = args.get(1).map(|v| v.as_i64() as usize).unwrap_or(0);
                 let n = args.get(2).map(|v| v.as_i64() as usize).unwrap_or(0);
+                // Cap to the data length: past EOF both sides read as 0, so
+                // further iterations can never change the result — this stops a
+                // hostile huge/negative length from hanging the UI thread, and
+                // checked indexing stops a huge `p+k` from overflow-panicking.
+                let n = n.min(self.data.len());
                 let mut res = 0i64;
                 for k in 0..n {
-                    let x = self.data.get(p1 + k).copied().unwrap_or(0);
-                    let y = self.data.get(p2 + k).copied().unwrap_or(0);
+                    let x = p1.checked_add(k).and_then(|i| self.data.get(i)).copied().unwrap_or(0);
+                    let y = p2.checked_add(k).and_then(|i| self.data.get(i)).copied().unwrap_or(0);
                     if x != y {
                         res = x as i64 - y as i64;
                         break;
@@ -957,7 +1003,7 @@ impl<'a> Interp<'a> {
                 self.log.push_str(&s);
                 Value::Void
             }
-            "Abs" => Value::Int(a0().as_i64().abs()),
+            "Abs" => Value::Int(a0().as_i64().saturating_abs()),
             "Min" => Value::Int(
                 args.iter().map(|v| v.as_i64()).min().unwrap_or(0),
             ),
@@ -972,11 +1018,15 @@ impl<'a> Interp<'a> {
     /// Peek a numeric value without advancing the cursor. Optional first arg is
     /// an absolute position (defaults to the current cursor).
     fn peek_num(&self, args: &[Value], size: usize, kind: Kind) -> Value {
+        // A negative position argument casts to a huge usize; use checked math
+        // so it (and any out-of-range position) returns 0 instead of overflow-
+        // panicking on `at + size` or OOB-slicing `self.data[at..]`.
         let at = args.first().map(|v| v.as_i64() as usize).unwrap_or(self.pos);
-        if at + size > self.data.len() {
-            return Value::Int(0);
-        }
-        decode_primitive(&self.data[at..at + size], kind, self.little_endian)
+        let end = match at.checked_add(size) {
+            Some(e) if e <= self.data.len() => e,
+            _ => return Value::Int(0),
+        };
+        decode_primitive(&self.data[at..end], kind, self.little_endian)
     }
 
     fn printf(&mut self, args: &[Value]) -> String {
@@ -1047,7 +1097,13 @@ impl<'a> Interp<'a> {
                 "hex" => return format!("0x{:X}", n),
                 "binary" => return format!("0b{:b}", n),
                 "octal" => return format!("0o{:o}", n),
-                "decimal" => return n.to_string(),
+                "decimal" => {
+                    return if kind == Kind::Unsigned {
+                        (n as u64).to_string()
+                    } else {
+                        n.to_string()
+                    }
+                }
                 _ => {}
             }
         }
@@ -1062,6 +1118,10 @@ impl<'a> Interp<'a> {
                     n.to_string()
                 }
             }
+            // Values are decoded into an i64; an unsigned field above i64::MAX
+            // is stored with the sign bit set, so render it back through u64 or
+            // it prints as a spurious negative.
+            Kind::Unsigned => (v.as_i64() as u64).to_string(),
             _ => v.as_i64().to_string(),
         }
     }
