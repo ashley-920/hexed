@@ -48,7 +48,10 @@ pub fn inspect(data: &[u8], offset: usize, endian: Endian) -> Vec<Interpretation
 
     macro_rules! push {
         ($label:expr, $v:expr) => {
-            out.push(Interpretation { label: $label, value: $v });
+            out.push(Interpretation {
+                label: $label,
+                value: $v,
+            });
         };
     }
 
@@ -65,26 +68,52 @@ pub fn inspect(data: &[u8], offset: usize, endian: Endian) -> Vec<Interpretation
     }
 
     if let Some(b) = take::<2>(rest) {
-        let i = if le { i16::from_le_bytes(b) } else { i16::from_be_bytes(b) };
-        let u = if le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) };
+        let i = if le {
+            i16::from_le_bytes(b)
+        } else {
+            i16::from_be_bytes(b)
+        };
+        let u = if le {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        };
         push!("int16", i.to_string());
         push!("uint16", u.to_string());
     }
 
     // Color interpretations (rendered with a swatch in the UI).
     if rest.len() >= 3 {
-        push!("RGB", format!("#{:02X}{:02X}{:02X}", rest[0], rest[1], rest[2]));
+        push!(
+            "RGB",
+            format!("#{:02X}{:02X}{:02X}", rest[0], rest[1], rest[2])
+        );
     }
     if rest.len() >= 4 {
         push!(
             "RGBA",
-            format!("#{:02X}{:02X}{:02X}{:02X}", rest[0], rest[1], rest[2], rest[3])
+            format!(
+                "#{:02X}{:02X}{:02X}{:02X}",
+                rest[0], rest[1], rest[2], rest[3]
+            )
         );
     }
     if let Some(b) = take::<4>(rest) {
-        let i = if le { i32::from_le_bytes(b) } else { i32::from_be_bytes(b) };
-        let u = if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) };
-        let f = if le { f32::from_le_bytes(b) } else { f32::from_be_bytes(b) };
+        let i = if le {
+            i32::from_le_bytes(b)
+        } else {
+            i32::from_be_bytes(b)
+        };
+        let u = if le {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        };
+        let f = if le {
+            f32::from_le_bytes(b)
+        } else {
+            f32::from_be_bytes(b)
+        };
         push!("int32", i.to_string());
         push!("uint32", u.to_string());
         push!("float32", fmt_float(f));
@@ -96,9 +125,21 @@ pub fn inspect(data: &[u8], offset: usize, endian: Endian) -> Vec<Interpretation
         push!("DOS date/time", format_dos(dos_date, dos_time));
     }
     if let Some(b) = take::<8>(rest) {
-        let i = if le { i64::from_le_bytes(b) } else { i64::from_be_bytes(b) };
-        let u = if le { u64::from_le_bytes(b) } else { u64::from_be_bytes(b) };
-        let f = if le { f64::from_le_bytes(b) } else { f64::from_be_bytes(b) };
+        let i = if le {
+            i64::from_le_bytes(b)
+        } else {
+            i64::from_be_bytes(b)
+        };
+        let u = if le {
+            u64::from_le_bytes(b)
+        } else {
+            u64::from_be_bytes(b)
+        };
+        let f = if le {
+            f64::from_le_bytes(b)
+        } else {
+            f64::from_be_bytes(b)
+        };
         push!("int64", i.to_string());
         push!("uint64", u.to_string());
         push!("float64", fmt_float(f));
@@ -226,9 +267,8 @@ mod tests {
         let data = [0x01, 0x02, 0x03, 0x04];
         let le = inspect(&data, 0, Endian::Little);
         let be = inspect(&data, 0, Endian::Big);
-        let get = |v: &[Interpretation], l: &str| {
-            v.iter().find(|i| i.label == l).unwrap().value.clone()
-        };
+        let get =
+            |v: &[Interpretation], l: &str| v.iter().find(|i| i.label == l).unwrap().value.clone();
         assert_eq!(get(&le, "uint32"), 0x0403_0201u32.to_string());
         assert_eq!(get(&be, "uint32"), 0x0102_0304u32.to_string());
         assert_eq!(get(&le, "uint8"), "1");

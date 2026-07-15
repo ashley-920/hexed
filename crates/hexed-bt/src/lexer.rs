@@ -113,7 +113,11 @@ impl Lexer<'_> {
         self.skip_trivia()?;
         let start = self.pos;
         let Some(c) = self.peek() else {
-            return Ok(Token { kind: TokKind::Eof, start, end: start });
+            return Ok(Token {
+                kind: TokKind::Eof,
+                start,
+                end: start,
+            });
         };
 
         if c == b'_' || c.is_ascii_alphabetic() {
@@ -121,7 +125,11 @@ impl Lexer<'_> {
                 self.pos += 1;
             }
             let s = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
-            return Ok(Token { kind: TokKind::Ident(s), start, end: self.pos });
+            return Ok(Token {
+                kind: TokKind::Ident(s),
+                start,
+                end: self.pos,
+            });
         }
         if c.is_ascii_digit() {
             return self.lex_number(start);
@@ -136,7 +144,11 @@ impl Lexer<'_> {
         for p in PUNCTS {
             if self.src[self.pos..].starts_with(p.as_bytes()) {
                 self.pos += p.len();
-                return Ok(Token { kind: TokKind::Punct(p), start, end: self.pos });
+                return Ok(Token {
+                    kind: TokKind::Punct(p),
+                    start,
+                    end: self.pos,
+                });
             }
         }
         Err(LexError::Unexpected(start, c as char))
@@ -156,16 +168,18 @@ impl Lexer<'_> {
             let text = std::str::from_utf8(&self.src[hs..self.pos]).unwrap();
             let v = u64::from_str_radix(text, 16).map_err(|_| LexError::BadNumber(start))? as i64;
             self.skip_num_suffix();
-            return Ok(Token { kind: TokKind::Int(v), start, end: self.pos });
+            return Ok(Token {
+                kind: TokKind::Int(v),
+                start,
+                end: self.pos,
+            });
         }
 
         let mut is_float = false;
         while matches!(self.peek(), Some(ch) if ch.is_ascii_digit()) {
             self.pos += 1;
         }
-        if self.peek() == Some(b'.')
-            && matches!(self.peek2(), Some(d) if d.is_ascii_digit())
-        {
+        if self.peek() == Some(b'.') && matches!(self.peek2(), Some(d) if d.is_ascii_digit()) {
             is_float = true;
             self.pos += 1;
             while matches!(self.peek(), Some(ch) if ch.is_ascii_digit()) {
@@ -190,7 +204,11 @@ impl Lexer<'_> {
             TokKind::Int(text.parse().map_err(|_| LexError::BadNumber(start))?)
         };
         self.skip_num_suffix();
-        Ok(Token { kind, start, end: self.pos })
+        Ok(Token {
+            kind,
+            start,
+            end: self.pos,
+        })
     }
 
     fn skip_num_suffix(&mut self) {
@@ -207,7 +225,11 @@ impl Lexer<'_> {
                 None => return Err(LexError::Unterminated(start)),
                 Some(b'"') => {
                     self.pos += 1;
-                    return Ok(Token { kind: TokKind::Str(s), start, end: self.pos });
+                    return Ok(Token {
+                        kind: TokKind::Str(s),
+                        start,
+                        end: self.pos,
+                    });
                 }
                 Some(b'\\') => {
                     self.pos += 1;
@@ -238,7 +260,11 @@ impl Lexer<'_> {
             return Err(LexError::Unterminated(start));
         }
         self.pos += 1;
-        Ok(Token { kind: TokKind::Char(ch), start, end: self.pos })
+        Ok(Token {
+            kind: TokKind::Char(ch),
+            start,
+            end: self.pos,
+        })
     }
 
     /// Decode the escape sequence after a backslash (which has been consumed).
@@ -367,8 +393,12 @@ mod tests {
         let toks = tokenize(src).unwrap();
         assert_eq!(toks.last().unwrap().kind, TokKind::Eof);
         // spot check a few tokens exist
-        assert!(toks.iter().any(|t| t.kind == TokKind::Ident("typedef".into())));
-        assert!(toks.iter().any(|t| t.kind == TokKind::Ident("CHUNK".into())));
+        assert!(toks
+            .iter()
+            .any(|t| t.kind == TokKind::Ident("typedef".into())));
+        assert!(toks
+            .iter()
+            .any(|t| t.kind == TokKind::Ident("CHUNK".into())));
         assert!(toks.iter().any(|t| t.kind == TokKind::Punct("<")));
     }
 

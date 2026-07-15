@@ -8,14 +8,14 @@
 
 use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense};
 use egui::{pos2, vec2};
-use hexed_core::{
-    apply_block_op, brute_force_single_byte, find_pattern, find_strings, find_text, hash_all,
-    entropy_profile, inspect, parse_hex_pattern, parse_key, parse_pe, shannon_entropy, to_base64,
-    to_c_array, to_hex_string, to_text, to_yara_hex, to_yara_rule, xor_preview, yara_file_magic,
-    yara_scan, BlockOp, Buffer, Endian, FoundString, Hashes, PeInfo, ScoredKey, StringKind,
-    YaraMatch,
-};
 use hexed_core::disasm::disassemble;
+use hexed_core::{
+    apply_block_op, brute_force_single_byte, entropy_profile, find_pattern, find_strings,
+    find_text, hash_all, inspect, parse_hex_pattern, parse_key, parse_pe, shannon_entropy,
+    to_base64, to_c_array, to_hex_string, to_text, to_yara_hex, to_yara_rule, xor_preview,
+    yara_file_magic, yara_scan, BlockOp, Buffer, Endian, FoundString, Hashes, PeInfo, ScoredKey,
+    StringKind, YaraMatch,
+};
 use hexed_core::{
     byte_histogram, defang, diff_aligned, extract_iocs, find_embedded, imphash, md5_hex,
     scan_signatures, sha256_hex, suspicious_apis, ApiFlag, Embedded, Histogram, Ioc, IocKind,
@@ -132,7 +132,9 @@ fn icon_to_png(raw: &[u8]) -> Option<(u32, u32, Vec<u8>, Vec<u8>)> {
 fn set_dark_titlebar() {
     use objc2_app_kit::{NSAppearance, NSAppearanceNameDarkAqua, NSApplication};
     use objc2_foundation::MainThreadMarker;
-    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
     let app = NSApplication::sharedApplication(mtm);
     // App-wide dark appearance darkens the title bar, menus, and native dialogs.
     let dark = unsafe { NSAppearance::appearanceNamed(NSAppearanceNameDarkAqua) };
@@ -142,6 +144,10 @@ fn set_dark_titlebar() {
 fn set_dark_titlebar() {}
 
 fn main() -> eframe::Result<()> {
+    // Register the macOS "Open With" ('odoc') handler FIRST — before eframe spins
+    // up NSApplication — so its willFinishLaunching observer is in place to catch
+    // a cold-launch document (delivered during app launch, before our UI exists).
+    openwith::install();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1180.0, 780.0])
         .with_min_inner_size([760.0, 480.0])
@@ -161,8 +167,8 @@ fn main() -> eframe::Result<()> {
             let mut app = HexedApp::default();
             install_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx, app.theme);
-            // Receive files opened via Finder "Open With" (macOS 'odoc' events).
-            openwith::install(&cc.egui_ctx);
+            // Wire egui so the (already-installed) 'odoc' handler can nudge repaints.
+            openwith::set_context(&cc.egui_ctx);
             // Darken the native macOS title bar to match the dark theme.
             set_dark_titlebar();
             for p in &initial_paths {
@@ -220,6 +226,15 @@ struct Document {
     /// Frames remaining to keep re-applying `scroll_to` (lets egui's scroll
     /// settle on a huge virtualized buffer instead of missing on one frame).
     scroll_ttl: u8,
+    /// A pending "reveal this byte range in the Text view" request (offset, len),
+    /// set by `goto` alongside the hex scroll/selection. The hex grid uses
+    /// `scroll_to`/`sel_*`; the Text view consumes this to scroll + select the
+    /// match, so Find / Goto / click-to-jump work in Text view too.
+    text_reveal: Option<(usize, usize)>,
+    /// Frames left to keep re-applying `text_reveal`. Focusing the field makes
+    /// egui scroll the whole widget to the top; re-asserting our scroll for a few
+    /// frames wins that race and lands on the match (mirrors `scroll_ttl`).
+    text_reveal_ttl: u8,
     /// Parsed PE structure, if this file is a PE (cached; recomputed on edit).
     pe: Option<PeInfo>,
     /// Named offset bookmarks for this file.
@@ -261,17 +276,23 @@ struct Document {
     yara_lib_errors: Vec<(String, String)>,
     /// SHA-256 of the whole file (cached; used for VirusTotal lookups).
     file_sha256: String,
-    /// Editable text-view buffer (the file decoded as UTF-8-lossy). Refreshed
-    /// from `buffer` when `text_valid` is false (i.e. after an out-of-view edit).
+    /// Editable text-view buffer (the file decoded as UTF-8-lossy). Rebuilt from
+    /// `buffer` whenever `buffer.generation()` no longer matches `text_gen`, so
+    /// *any* byte mutation (edit, undo/redo, XOR, block-op, …) refreshes it.
     text_buf: String,
-    /// Whether `text_buf` reflects the current byte buffer.
-    text_valid: bool,
+    /// The `buffer.generation()` that `text_buf` was decoded from. `u64::MAX`
+    /// means "never built" so the first view always rebuilds.
+    text_gen: u64,
     /// Whether `text_buf` has edits not yet committed to the byte buffer.
     text_dirty: bool,
     /// Which nibble the hex-edit caret is on (false = high, true = low).
     hex_low_nibble: bool,
     /// Whether hex-view typing edits the ASCII pane (true) or hex pane (false).
     edit_ascii: bool,
+    /// Frames remaining until the heavy re-analysis fires after a byte edit.
+    /// Reset on each keystroke so rapid typing coalesces into one rescan once
+    /// typing stops (0 = idle). See the debounce tick in `update`.
+    derived_ttl: u32,
 }
 
 impl Document {
@@ -294,6 +315,8 @@ impl Document {
             search_idx: 0,
             scroll_to: Some(0),
             scroll_ttl: 4,
+            text_reveal: None,
+            text_reveal_ttl: 0,
             pe: None,
             bookmarks: Vec::new(),
             entropy_profile: Vec::new(),
@@ -316,10 +339,11 @@ impl Document {
             yara_lib_errors: Vec::new(),
             file_sha256: String::new(),
             text_buf: String::new(),
-            text_valid: false,
+            text_gen: u64::MAX,
             text_dirty: false,
             hex_low_nibble: false,
             edit_ascii: false,
+            derived_ttl: 0,
         }
     }
 
@@ -337,7 +361,23 @@ impl Document {
         self.scroll_ttl = 4;
         self.sel_anchor = Some(off);
         self.sel_cursor = Some((off + len).saturating_sub(1));
+        // Mirror the jump into the Text view (consumed by draw_text): scroll to
+        // and select the same range, so Find / Goto / click-to-jump land there
+        // too, not only in the hex grid.
+        self.text_reveal = Some((off, len.max(1)));
+        self.text_reveal_ttl = 4;
     }
+}
+
+/// Largest char boundary `<= i` (clamped to `s.len()`). Lets the Text view turn a
+/// byte offset (from a Find hit / Goto) into a slice index that never panics on a
+/// multi-byte UTF-8 boundary before counting chars for egui's char-based cursor.
+fn char_boundary_floor(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// Invalidate derived state after a length-changing edit: all offset-based
@@ -351,12 +391,24 @@ fn invalidate_derived(d: &mut Document) {
     d.diff_summary = None;
     d.bt_spans.clear();
     d.bt_result = None;
-    d.text_valid = false;
+    // Note: the text-view cache invalidates itself via buffer.generation(), so
+    // it needs no signal here — every byte mutation is covered, not just these.
 }
+
+/// YARA "scan all" results: per file, its `(doc index, name, matches-or-error)`.
+type YaraScanResults = Vec<(usize, String, Result<Vec<YaraMatch>, String>)>;
 
 struct HexedApp {
     docs: Vec<Document>,
     active: usize,
+    /// The `active` index seen on the previous frame; when it changes we drop the
+    /// hex grid's keyboard focus so a keystroke can't land on a doc the user
+    /// never clicked into (see the focus reset in `update`).
+    last_active: usize,
+    /// Set when a document is removed: closing the active (non-last) tab shifts a
+    /// *different* doc into the same index, so an index compare alone misses it —
+    /// this forces the grid-focus drop regardless of index.
+    grid_focus_stale: bool,
     /// Clipboard-copy feedback: which button flashed and until when (egui time).
     copy_flash_id: &'static str,
     copy_flash_until: f64,
@@ -371,7 +423,7 @@ struct HexedApp {
     strings_filter: String,
     yara_source: String,
     /// Per-tab scan results: (doc index, file name, matches-or-error).
-    yara_result: Option<Vec<(usize, String, Result<Vec<YaraMatch>, String>)>>,
+    yara_result: Option<YaraScanResults>,
     /// Current `.bt` template source (shared editing surface across tabs).
     bt_source: String,
     /// Auto-load + run the matching built-in template when a file is opened.
@@ -437,7 +489,13 @@ fn load_view() -> ViewMode {
     std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".hexed_view.txt"))
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| if s.trim() == "text" { ViewMode::Text } else { ViewMode::Hex })
+        .map(|s| {
+            if s.trim() == "text" {
+                ViewMode::Text
+            } else {
+                ViewMode::Hex
+            }
+        })
         .unwrap_or(ViewMode::Hex)
 }
 
@@ -483,7 +541,7 @@ fn today_ymd() -> String {
 }
 
 /// Starter YARA rule scaffold ("New template"): the standard meta block (author
-/// + today's date) plus example hex/string patterns and a composite condition.
+/// and today's date) plus example hex/string patterns and a composite condition.
 /// Modeled on the style of well-formed threat-intel rules.
 fn yara_template() -> String {
     format!(
@@ -587,7 +645,8 @@ fn load_bookmarks() -> BookmarkStore {
     if let Some(s) = bookmarks_file_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         for line in s.lines() {
             let mut parts = line.splitn(3, '\t');
-            if let (Some(path), Some(off), Some(name)) = (parts.next(), parts.next(), parts.next()) {
+            if let (Some(path), Some(off), Some(name)) = (parts.next(), parts.next(), parts.next())
+            {
                 if let Ok(o) = off.parse::<usize>() {
                     map.entry(std::path::PathBuf::from(path))
                         .or_default()
@@ -683,9 +742,7 @@ fn list_yara_templates() -> Vec<(String, std::path::PathBuf)> {
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let p = e.path();
-                let is_yar = p
-                    .extension()
-                    .is_some_and(|x| x == "yar" || x == "yara");
+                let is_yar = p.extension().is_some_and(|x| x == "yar" || x == "yara");
                 if is_yar {
                     let name = p
                         .file_stem()
@@ -696,7 +753,7 @@ fn list_yara_templates() -> Vec<(String, std::path::PathBuf)> {
             }
         }
     }
-    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.sort_by_key(|a| a.0.to_lowercase());
     out
 }
 
@@ -745,6 +802,8 @@ impl Default for HexedApp {
         Self {
             docs: Vec::new(),
             active: 0,
+            last_active: 0,
+            grid_focus_stale: false,
             copy_flash_id: "",
             copy_flash_until: 0.0,
             strings_min_len: 4,
@@ -823,7 +882,10 @@ impl HexedApp {
             .and_then(|d| detect_builtin_index(d.buffer.data()));
         let Some(i) = detected else { return };
         let src = BUILTIN_TEMPLATES[i].1;
-        let res = self.docs.last().map(|d| hexed_bt::run(src, d.buffer.data()));
+        let res = self
+            .docs
+            .last()
+            .map(|d| hexed_bt::run(src, d.buffer.data()));
         if let (Some(res), Some(d)) = (res, self.docs.last_mut()) {
             d.bt_spans.clear();
             if let Ok(t) = &res {
@@ -876,10 +938,11 @@ impl HexedApp {
 
     /// Persist the given doc's bookmarks under its file path.
     fn sync_bookmarks(&mut self, i: usize) {
-        let entry = self
-            .docs
-            .get(i)
-            .and_then(|d| d.buffer.path().map(|p| (p.to_path_buf(), d.bookmarks.clone())));
+        let entry = self.docs.get(i).and_then(|d| {
+            d.buffer
+                .path()
+                .map(|p| (p.to_path_buf(), d.bookmarks.clone()))
+        });
         if let Some((path, bms)) = entry {
             if bms.is_empty() {
                 self.bookmarks_store.remove(&path);
@@ -895,11 +958,25 @@ impl HexedApp {
             return;
         }
         self.docs.remove(i);
+        // A remove can slide a different document into `active`'s slot without
+        // changing the index, so force a grid-focus drop (see update()).
+        self.grid_focus_stale = true;
         if self.active > i {
             self.active -= 1;
         }
         if self.active >= self.docs.len() {
             self.active = self.docs.len().saturating_sub(1);
+        }
+        // YARA "scan all" results hold absolute doc indices used for click-to-
+        // jump; drop the closed doc's group and shift the rest so a later click
+        // still lands on the right file instead of a shifted-in one.
+        if let Some(groups) = &mut self.yara_result {
+            groups.retain(|(di, _, _)| *di != i);
+            for (di, _, _) in groups.iter_mut() {
+                if *di > i {
+                    *di -= 1;
+                }
+            }
         }
     }
 }
@@ -911,6 +988,37 @@ impl eframe::App for HexedApp {
             ai::Poll::Running => ctx.request_repaint(),
             ai::Poll::JustDone => self.on_ai_done(),
             ai::Poll::Idle => {}
+        }
+
+        // ---- flush + drop editor focus when the active document changed ----
+        // The hex grid and the Text-view field both use constant focus ids, so
+        // focus would otherwise persist across tab switch / open / close onto a
+        // document the user never clicked into. A pointer-driven switch (clicking
+        // a tab) blurs them via egui's press-elsewhere rule, but a keyboard one
+        // (⌘W / ⌘O) has no such press, so a stray keystroke would silently edit
+        // the incoming document. Surrender both here to require a fresh click.
+        // `grid_focus_stale` covers closes that swap a new doc into the same
+        // index (where the index compare alone would miss it).
+        //
+        // Crucially, commit the OUTGOING doc's pending text edit first. Dropping
+        // focus without committing would leave that doc `text_dirty` yet
+        // unfocused — a state where draw_text's `!text_dirty` rebuild gate freezes
+        // text_buf at the stale edit while the byte buffer can still move (undo,
+        // XOR, block-op, …), so the next commit_text would replace_all the stale
+        // text over those bytes and save the wrong file. commit_text only ever
+        // writes docs[i].text_buf into docs[i].buffer and no-ops unless that doc
+        // is dirty, so committing last_active is safe even when a close has since
+        // shifted a different (clean) doc into that slot.
+        if self.active != self.last_active || self.grid_focus_stale {
+            if self.last_active < self.docs.len() {
+                self.commit_text(self.last_active);
+            }
+            ctx.memory_mut(|m| {
+                m.surrender_focus(egui::Id::new(HEX_GRID_ID));
+                m.surrender_focus(egui::Id::new(TEXT_EDIT_ID));
+            });
+            self.last_active = self.active;
+            self.grid_focus_stale = false;
         }
 
         // ---- files opened via Finder "Open With" (macOS 'odoc' events) ----
@@ -952,7 +1060,8 @@ impl eframe::App for HexedApp {
         // The hex grid is also focusable (for byte-editing) but is NOT a text
         // field, so exclude it — otherwise clicking the grid would disable ⌘A.
         let typing = ctx.memory(|m| {
-            m.focused().is_some_and(|id| id != egui::Id::new(HEX_GRID_ID))
+            m.focused()
+                .is_some_and(|id| id != egui::Id::new(HEX_GRID_ID))
         });
         ctx.input(|i| {
             if i.modifiers.command {
@@ -974,14 +1083,18 @@ impl eframe::App for HexedApp {
                 if i.key_pressed(egui::Key::W) {
                     action_close = true;
                 }
-                if i.key_pressed(egui::Key::Z) {
+                // Don't fire buffer undo/redo while a text field owns focus —
+                // the field (e.g. the editable Text view, Find, Goto) runs its
+                // OWN undo, and doing both would diverge text_buf from the buffer.
+                // (`typing` excludes the hex grid, so Cmd+Z still works there.)
+                if i.key_pressed(egui::Key::Z) && !typing {
                     if i.modifiers.shift {
                         action_redo = true;
                     } else {
                         action_undo = true;
                     }
                 }
-                if i.key_pressed(egui::Key::Y) {
+                if i.key_pressed(egui::Key::Y) && !typing {
                     action_redo = true;
                 }
             }
@@ -1021,12 +1134,33 @@ impl eframe::App for HexedApp {
             }
         }
 
+        // ---- debounce heavy re-analysis while byte-editing ----
+        // Byte edits (draw_hex) set derived_ttl instead of strings_dirty so that
+        // rapid typing doesn't re-hash + re-scan + re-run YARA over the whole
+        // file every keystroke; the rescan fires once, a few frames after the
+        // last keystroke. (The text-view cache updates immediately via
+        // buffer.generation(); only the expensive analyses are deferred.)
+        if let Some(d) = self.docs.get_mut(a) {
+            if d.derived_ttl > 0 {
+                d.derived_ttl -= 1;
+                if d.derived_ttl == 0 {
+                    d.strings_dirty = true;
+                } else {
+                    ctx.request_repaint(); // keep frames coming until it settles
+                }
+            }
+        }
+
         // ---- rescan strings for the active doc if needed ----
         let mut rebuilt_derived = false;
         if let Some(d) = self.docs.get_mut(a) {
             if d.strings_dirty {
-                d.strings =
-                    find_strings(d.buffer.data(), self.strings_min_len, self.strings_ascii, self.strings_utf16);
+                d.strings = find_strings(
+                    d.buffer.data(),
+                    self.strings_min_len,
+                    self.strings_ascii,
+                    self.strings_utf16,
+                );
                 d.pe = parse_pe(d.buffer.data());
                 d.entropy_profile = entropy_profile(d.buffer.data(), 512);
                 d.histogram = byte_histogram(d.buffer.data());
@@ -1065,9 +1199,18 @@ impl eframe::App for HexedApp {
         // and (if enrichment is on) queue a VirusTotal lookup for its hash.
         if rebuilt_derived {
             self.rescan_yara_active(a);
+            // Only look a file up on VirusTotal when it is unmodified. Editing a
+            // byte changes the hash to one VT can't know, so a lookup would just
+            // burn quota and leak that we're mutating the sample.
             if self.vt.enabled {
-                let sha = self.docs.get(a).map(|d| d.file_sha256.clone()).unwrap_or_default();
-                self.vt.request(&sha);
+                let sha = self
+                    .docs
+                    .get(a)
+                    .filter(|d| !d.buffer.is_dirty())
+                    .map(|d| d.file_sha256.clone());
+                if let Some(sha) = sha {
+                    self.vt.request(&sha);
+                }
             }
         }
         // Drain any finished VT lookup.
@@ -1086,8 +1229,16 @@ impl eframe::App for HexedApp {
 
         // snapshot editable per-doc fields into locals (widgets edit these; we
         // write them back after the panels so closures never mutate `self`).
-        let mut xor_key = self.docs.get(a).map(|d| d.xor_key.clone()).unwrap_or_default();
-        let mut search_query = self.docs.get(a).map(|d| d.search_query.clone()).unwrap_or_default();
+        let mut xor_key = self
+            .docs
+            .get(a)
+            .map(|d| d.xor_key.clone())
+            .unwrap_or_default();
+        let mut search_query = self
+            .docs
+            .get(a)
+            .map(|d| d.search_query.clone())
+            .unwrap_or_default();
         let mut search_hex = self.docs.get(a).map(|d| d.search_hex).unwrap_or(false);
         let mut search_ci = self.docs.get(a).map(|d| d.search_ci).unwrap_or(false);
         let search_hits_len = self.docs.get(a).map(|d| d.search_hits.len()).unwrap_or(0);
@@ -1180,7 +1331,10 @@ impl eframe::App for HexedApp {
                 if ui.add_enabled(has_doc, egui::Button::new("Save")).clicked() {
                     action_save = true;
                 }
-                if ui.add_enabled(has_doc, egui::Button::new("Save As")).clicked() {
+                if ui
+                    .add_enabled(has_doc, egui::Button::new("Save As"))
+                    .clicked()
+                {
                     action_save_as = true;
                 }
                 ui.separator();
@@ -1210,12 +1364,10 @@ impl eframe::App for HexedApp {
                     );
                 }
                 if let Some(h) = sel_entropy {
-                    ui.label(
-                        egui::RichText::new(format!("H={h:.2}"))
-                            .monospace()
-                            .weak(),
-                    )
-                    .on_hover_text("Shannon entropy of selection (0–8 bits/byte; >7 ≈ packed/encrypted)");
+                    ui.label(egui::RichText::new(format!("H={h:.2}")).monospace().weak())
+                        .on_hover_text(
+                            "Shannon entropy of selection (0–8 bits/byte; >7 ≈ packed/encrypted)",
+                        );
                 }
                 // Bytes-per-row selector (right-aligned).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1246,7 +1398,13 @@ impl eframe::App for HexedApp {
                     ui.horizontal(|ui| {
                         for (i, d) in self.docs.iter().enumerate() {
                             let active = i == a;
-                            let dirty = if d.buffer.is_dirty() { " *" } else { "" };
+                            // Uncommitted text-view edits (text_dirty) count too —
+                            // they aren't in the byte buffer yet but are unsaved.
+                            let dirty = if d.buffer.is_dirty() || d.text_dirty {
+                                " *"
+                            } else {
+                                ""
+                            };
                             let name = format!("{}{}", d.file_name, dirty);
                             // Each tab is a distinct rounded chip: filled when
                             // active, faintly outlined otherwise, so they read
@@ -1270,8 +1428,11 @@ impl eframe::App for HexedApp {
                                     );
                                     let lbl = ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(&name)
-                                                .color(if active { pal.text } else { pal.dim }),
+                                            egui::RichText::new(&name).color(if active {
+                                                pal.text
+                                            } else {
+                                                pal.dim
+                                            }),
                                         )
                                         .selectable(false)
                                         .sense(Sense::click()),
@@ -1329,7 +1490,8 @@ impl eframe::App for HexedApp {
                     ui.selectable_value(&mut search_hex, true, "Hex");
                     ui.selectable_value(&mut search_hex, false, "Text");
                     if !search_hex {
-                        ui.checkbox(&mut search_ci, "Aa").on_hover_text("case-insensitive");
+                        ui.checkbox(&mut search_ci, "Aa")
+                            .on_hover_text("case-insensitive");
                     }
                     if ui.button("Find All").clicked() {
                         action_find = true;
@@ -3001,12 +3163,20 @@ impl eframe::App for HexedApp {
             self.vt.enabled = vt_enabled;
             save_vt_enabled(vt_enabled);
             if vt_enabled {
-                let sha = self.docs.get(a).map(|d| d.file_sha256.clone()).unwrap_or_default();
+                let sha = self
+                    .docs
+                    .get(a)
+                    .map(|d| d.file_sha256.clone())
+                    .unwrap_or_default();
                 self.vt.request(&sha);
             }
         }
         if vt_open {
-            let sha = self.docs.get(a).map(|d| d.file_sha256.clone()).unwrap_or_default();
+            let sha = self
+                .docs
+                .get(a)
+                .map(|d| d.file_sha256.clone())
+                .unwrap_or_default();
             if sha.len() == 64 {
                 let url = format!("https://www.virustotal.com/gui/file/{sha}");
                 let _ = std::process::Command::new("open").arg(url).spawn();
@@ -3069,8 +3239,7 @@ impl eframe::App for HexedApp {
                 AiAction::Yara => ("yara", AI_YARA.to_string()),
                 AiAction::Triage => {
                     if let Some(rep) = self.docs.get(a).and_then(|d| {
-                        d.pe
-                            .as_ref()
+                        d.pe.as_ref()
                             .map(|pe| build_pe_report(&d.file_name, d.buffer.data(), pe))
                     }) {
                         context.push_str("\n\n=== PE report ===\n");
@@ -3081,7 +3250,11 @@ impl eframe::App for HexedApp {
                 AiAction::Disasm => {
                     if let Some(d) = self.docs.get(a) {
                         if let Some((s, e)) = d.selection_range() {
-                            let bits = if d.pe.as_ref().is_some_and(|p| p.is_64) { 64 } else { 32 };
+                            let bits = if d.pe.as_ref().is_some_and(|p| p.is_64) {
+                                64
+                            } else {
+                                32
+                            };
                             let end = (s + (e - s).min(1024)).min(d.buffer.len());
                             let insns = disassemble(d.buffer.slice(s, end), bits, s as u64, 300);
                             context.push_str("\n\n=== disassembly ===\n");
@@ -3211,6 +3384,7 @@ impl eframe::App for HexedApp {
 
         // ---- insert / delete bytes (resize + undoable) ----
         if let Some((off, n)) = action_insert {
+            self.commit_text(a); // flush any pending text-view edits first
             let mut st = None;
             if let Some(d) = self.docs.get_mut(a) {
                 let off = off.min(d.buffer.len());
@@ -3229,6 +3403,7 @@ impl eframe::App for HexedApp {
             }
         }
         if let Some((off, len)) = action_delete {
+            self.commit_text(a); // flush any pending text-view edits first
             let mut st = None;
             if let Some(d) = self.docs.get_mut(a) {
                 let len = len.min(d.buffer.len().saturating_sub(off));
@@ -3278,9 +3453,11 @@ impl eframe::App for HexedApp {
 
         // ---- find & replace (overwrite-only ⇒ equal length required) ----
         if action_replace_next || action_replace_all {
+            self.commit_text(a); // flush any pending text-view edits first
             let rep = if search_hex {
-                parse_hex_bytes(&replace_query)
-                    .ok_or_else(|| "Replacement must be concrete hex bytes (e.g. 90 90).".to_string())
+                parse_hex_bytes(&replace_query).ok_or_else(|| {
+                    "Replacement must be concrete hex bytes (e.g. 90 90).".to_string()
+                })
             } else {
                 Ok(replace_query.as_bytes().to_vec())
             };
@@ -3481,8 +3658,7 @@ impl eframe::App for HexedApp {
                     [w as usize, h as usize],
                     rgba.as_raw(),
                 );
-                self.logo_tex =
-                    Some(ctx.load_texture("logo", ci, egui::TextureOptions::LINEAR));
+                self.logo_tex = Some(ctx.load_texture("logo", ci, egui::TextureOptions::LINEAR));
             }
         }
         let mut about_open = self.show_about;
@@ -3529,9 +3705,14 @@ impl eframe::App for HexedApp {
         // ---- carve selection into a new in-memory tab ----
         if let Some((start, bytes)) = carve {
             let n = bytes.len();
-            let src = self.docs.get(a).map(|d| d.file_name.clone()).unwrap_or_default();
+            let src = self
+                .docs
+                .get(a)
+                .map(|d| d.file_name.clone())
+                .unwrap_or_default();
             let name = format!("{src}@0x{start:X} ({n}B)");
-            self.docs.push(Document::new(Buffer::from_bytes(bytes), name));
+            self.docs
+                .push(Document::new(Buffer::from_bytes(bytes), name));
             self.active = self.docs.len() - 1;
             self.maybe_autorun_template(); // auto-parse if the blob is a known format
             self.status = format!("Carved {n} bytes from 0x{start:X} into a new tab");
@@ -3558,7 +3739,8 @@ impl eframe::App for HexedApp {
             if let Some((bytes, src)) = carved {
                 let n = bytes.len();
                 let name = format!("{src}@0x{off:X} ({n}B)");
-                self.docs.push(Document::new(Buffer::from_bytes(bytes), name));
+                self.docs
+                    .push(Document::new(Buffer::from_bytes(bytes), name));
                 self.active = self.docs.len() - 1;
                 self.maybe_autorun_template();
                 self.status = format!("Extracted {n} bytes from 0x{off:X} into a new tab");
@@ -3576,7 +3758,11 @@ impl eframe::App for HexedApp {
                     }
                     s.push_str(&format!("# {}\n", kind.label()));
                     for ioc in group {
-                        let v = if defanged { defang(&ioc.value) } else { ioc.value.clone() };
+                        let v = if defanged {
+                            defang(&ioc.value)
+                        } else {
+                            ioc.value.clone()
+                        };
                         s.push_str(&v);
                         s.push('\n');
                     }
@@ -3594,9 +3780,21 @@ impl eframe::App for HexedApp {
         // ---- build + copy a full triage report ----
         if action_triage {
             // Include the VirusTotal verdict only if enrichment is opted in.
-            let sha = self.docs.get(a).map(|d| d.file_sha256.clone()).unwrap_or_default();
-            let vt = if self.vt.enabled { self.vt.get(&sha).cloned() } else { None };
-            if let Some(r) = self.docs.get(a).map(|d| build_triage_report(d, vt.as_ref())) {
+            let sha = self
+                .docs
+                .get(a)
+                .map(|d| d.file_sha256.clone())
+                .unwrap_or_default();
+            let vt = if self.vt.enabled {
+                self.vt.get(&sha).cloned()
+            } else {
+                None
+            };
+            if let Some(r) = self
+                .docs
+                .get(a)
+                .map(|d| build_triage_report(d, vt.as_ref()))
+            {
                 ctx.copy_text(r);
                 self.status = "Triage report copied to clipboard".to_string();
                 self.copy_flash_id = "triage";
@@ -3692,7 +3890,10 @@ impl eframe::App for HexedApp {
             let mut new_hashes = None;
             if let Some(d) = self.docs.get(a) {
                 let (label, data): (String, &[u8]) = if file {
-                    (format!("whole file ({} bytes)", d.buffer.len()), d.buffer.data())
+                    (
+                        format!("whole file ({} bytes)", d.buffer.len()),
+                        d.buffer.data(),
+                    )
                 } else if let Some((s, e)) = sel {
                     (
                         format!("selection 0x{s:X}–0x{e:X} ({} bytes)", e - s),
@@ -3792,7 +3993,9 @@ impl eframe::App for HexedApp {
                             Ok(()) => format!(
                                 "Saved {} bytes to {}",
                                 bytes.len(),
-                                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                                path.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default()
                             ),
                             Err(err) => format!("Save failed: {err}"),
                         };
@@ -3864,8 +4067,7 @@ impl eframe::App for HexedApp {
         }
         if action_pe_report {
             let report = self.docs.get(a).and_then(|d| {
-                d.pe
-                    .as_ref()
+                d.pe.as_ref()
                     .map(|pe| build_pe_report(&d.file_name, d.buffer.data(), pe))
             });
             if let Some(r) = report {
@@ -3955,7 +4157,10 @@ impl eframe::App for HexedApp {
                     self.status = match std::fs::write(&path, self.yara_source.as_bytes()) {
                         Ok(()) => {
                             self.reload_yara_library();
-                            format!("Saved to library: {} — auto-scans on open", abbrev_home(&path))
+                            format!(
+                                "Saved to library: {} — auto-scans on open",
+                                abbrev_home(&path)
+                            )
                         }
                         Err(e) => format!("Save failed: {e}"),
                     };
@@ -3975,7 +4180,10 @@ impl eframe::App for HexedApp {
                     .pick_file(),
             ) {
                 let _ = std::fs::create_dir_all(&dir);
-                let name = src.file_name().map(std::path::PathBuf::from).unwrap_or_default();
+                let name = src
+                    .file_name()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default();
                 let dest = dir.join(name);
                 self.status = match std::fs::copy(&src, &dest) {
                     Ok(_) => {
@@ -4042,9 +4250,7 @@ impl eframe::App for HexedApp {
 impl HexedApp {
     /// Draw the whole-file entropy minimap; returns a click-to-jump offset.
     fn draw_entropy_strip(&self, ui: &mut egui::Ui) -> Option<usize> {
-        let Some(doc) = self.docs.get(self.active) else {
-            return None;
-        };
+        let doc = self.docs.get(self.active)?;
         let (rect, resp) = ui.allocate_exact_size(
             vec2(ui.available_width(), ui.available_height()),
             Sense::click(),
@@ -4087,8 +4293,10 @@ impl HexedApp {
             if let Ok(img) = image::load_from_memory(LOGO_PNG) {
                 let rgba = img.to_rgba8();
                 let (w, h) = rgba.dimensions();
-                let ci =
-                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+                let ci = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    rgba.as_raw(),
+                );
                 self.logo_tex = Some(ctx.load_texture("logo", ci, egui::TextureOptions::LINEAR));
             }
         }
@@ -4222,7 +4430,11 @@ impl HexedApp {
         let _ = writeln!(s, "File: {}", d.file_name);
         match d.buffer.path() {
             Some(p) => {
-                let _ = writeln!(s, "Path on disk (you may read/scan this directly): {}", p.display());
+                let _ = writeln!(
+                    s,
+                    "Path on disk (you may read/scan this directly): {}",
+                    p.display()
+                );
             }
             None => {
                 let _ = writeln!(s, "Path on disk: (in-memory tab, not saved)");
@@ -4246,7 +4458,11 @@ impl HexedApp {
         if let Some((st, en)) = d.selection_range() {
             let cap = (en - st).min(4096);
             let sl = d.buffer.slice(st, st + cap);
-            let _ = writeln!(s, "\nCurrent selection: 0x{st:X}..0x{en:X} ({} bytes)", en - st);
+            let _ = writeln!(
+                s,
+                "\nCurrent selection: 0x{st:X}..0x{en:X} ({} bytes)",
+                en - st
+            );
             let _ = writeln!(s, "Selected bytes (hex): {}", to_hex_string(sl));
             let _ = writeln!(s, "Selected bytes (ascii): {}", to_text(sl));
         }
@@ -4289,11 +4505,13 @@ impl HexedApp {
             );
             return (None, None);
         }
-        // Rebuild the text buffer from bytes unless we hold uncommitted edits.
+        // Rebuild the text buffer from bytes when the buffer changed under us
+        // (any edit/undo/redo/op bumps generation), unless we hold uncommitted
+        // text edits of our own.
         if let Some(d) = self.docs.get_mut(active) {
-            if !d.text_valid && !d.text_dirty {
+            if !d.text_dirty && d.buffer.generation() != d.text_gen {
                 d.text_buf = String::from_utf8_lossy(d.buffer.data()).into_owned();
-                d.text_valid = true;
+                d.text_gen = d.buffer.generation();
             }
         }
         if !editable {
@@ -4311,15 +4529,58 @@ impl HexedApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if let Some(d) = self.docs.get_mut(active) {
-                    let r = ui.add(
-                        egui::TextEdit::multiline(&mut d.text_buf)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(30)
-                            .interactive(editable),
-                    );
-                    changed = r.changed();
-                    lost_focus = r.lost_focus();
+                    let out = egui::TextEdit::multiline(&mut d.text_buf)
+                        .id(egui::Id::new(TEXT_EDIT_ID))
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(30)
+                        .interactive(editable)
+                        .show(ui);
+                    changed = out.response.changed();
+                    lost_focus = out.response.lost_focus();
+
+                    // Reveal a pending Find / Goto / click-to-jump target: scroll to
+                    // it and (when editable, so egui paints the highlight) select it.
+                    // The byte offset maps 1:1 to a text_buf byte offset because the
+                    // editable text view requires valid UTF-8; clamp to a char
+                    // boundary so slicing can't panic, then count chars for the
+                    // char-based cursor. egui does NOT auto-scroll a programmatic
+                    // cursor, and focusing the field makes egui scroll the widget to
+                    // the top — so we re-assert our own scroll for `text_reveal_ttl`
+                    // frames to win that race and land on the match.
+                    if let Some((off, len)) = d.text_reveal {
+                        if d.text_reveal_ttl > 0 {
+                            // Only map the byte offset in the editable view. There
+                            // text_buf is the file verbatim (valid UTF-8), so byte
+                            // offsets line up 1:1. The read-only view decodes with
+                            // from_utf8_lossy, which inserts multi-byte U+FFFD for
+                            // each bad byte, so `off` wouldn't map — reveal would
+                            // scroll to the wrong place. Binaries: use the hex view.
+                            if editable {
+                                let s = char_boundary_floor(&d.text_buf, off);
+                                let e = char_boundary_floor(&d.text_buf, off.saturating_add(len));
+                                let cstart = d.text_buf[..s].chars().count();
+                                let cend = d.text_buf[..e].chars().count();
+                                let mut st = out.state;
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(cstart),
+                                    egui::text::CCursor::new(cend),
+                                )));
+                                st.store(ui.ctx(), egui::Id::new(TEXT_EDIT_ID));
+                                ui.memory_mut(|m| m.request_focus(egui::Id::new(TEXT_EDIT_ID)));
+                                let caret = out
+                                    .galley
+                                    .pos_from_ccursor(egui::text::CCursor::new(cstart))
+                                    .translate(out.galley_pos.to_vec2());
+                                ui.scroll_to_rect(caret.expand(24.0), Some(egui::Align::Center));
+                            }
+                            d.text_reveal_ttl -= 1;
+                            if d.text_reveal_ttl == 0 {
+                                d.text_reveal = None;
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                    }
                 }
             });
 
@@ -4344,7 +4605,14 @@ impl HexedApp {
                 d.buffer.replace_all(bytes);
                 d.text_dirty = false;
                 invalidate_derived(d);
-                d.text_valid = true; // text_buf already matches the buffer
+                // A text edit rewrites the whole buffer and can change its length,
+                // so byte-offset bookmarks past the new end are now invalid — drop
+                // them rather than let them jump past EOF.
+                let len = d.buffer.len();
+                d.bookmarks.retain(|(b, _)| *b < len);
+                // text_buf already equals the just-written buffer, so record its
+                // generation to avoid a redundant rebuild next frame.
+                d.text_gen = d.buffer.generation();
             }
         }
     }
@@ -4408,8 +4676,7 @@ impl HexedApp {
                 // Reserve the full virtual content height (this sets the scroll
                 // range) and take one response over it for hit-testing. Use a
                 // stable id so keyboard focus (for byte-editing) is identifiable.
-                let (rect, _) =
-                    ui.allocate_exact_size(vec2(total_w, content_h), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(vec2(total_w, content_h), Sense::hover());
                 let response =
                     ui.interact(rect, egui::Id::new(HEX_GRID_ID), Sense::click_and_drag());
                 let ox = rect.left();
@@ -4460,9 +4727,8 @@ impl HexedApp {
                     .filter(|(s, e)| *e > vis_start && *s < vis_end)
                     .copied()
                     .collect();
-                let diff_bg = |idx: usize| -> bool {
-                    vis_diffs.iter().any(|(s, e)| idx >= *s && idx < *e)
-                };
+                let diff_bg =
+                    |idx: usize| -> bool { vis_diffs.iter().any(|(s, e)| idx >= *s && idx < *e) };
 
                 for row in first..last {
                     let y = content_top + row as f32 * row_h;
@@ -4480,7 +4746,7 @@ impl HexedApp {
                             break;
                         }
                         let b = data[idx];
-                        let selected = sel.map_or(false, |(s, e)| idx >= s && idx < e);
+                        let selected = sel.is_some_and(|(s, e)| idx >= s && idx < e);
                         let col_color = byte_color(b, &self.palette);
 
                         let tbg = tmpl_bg(idx);
@@ -4519,7 +4785,11 @@ impl HexedApp {
                         if selected {
                             painter.rect_filled(ascii_rect, 1.0, sel_color);
                         }
-                        let ch = if (0x20..=0x7e).contains(&b) { b as char } else { '.' };
+                        let ch = if (0x20..=0x7e).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        };
                         painter.text(
                             pos2(ax, y),
                             Align2::LEFT_TOP,
@@ -4543,7 +4813,8 @@ impl HexedApp {
                         0
                     };
                     let idx = (row * bpr + col).min(len - 1);
-                    if response.drag_started_by(egui::PointerButton::Primary) || response.clicked() {
+                    if response.drag_started_by(egui::PointerButton::Primary) || response.clicked()
+                    {
                         result = Some(SelUpdate::Set(idx));
                         // Place the edit caret here: pick the clicked pane, reset
                         // to the high nibble, and take keyboard focus for typing.
@@ -4556,7 +4827,10 @@ impl HexedApp {
                 }
 
                 // ---- keyboard byte-editing (010-style) when the grid is focused ----
-                if response.has_focus() {
+                // Require a placed caret (a click sets sel_cursor): a fresh doc has
+                // sel_cursor=None, so a stray keystroke can't overwrite its byte 0
+                // just because the grid inherited focus from a previous document.
+                if response.has_focus() && caret0.is_some() {
                     let mut cur = caret0.unwrap_or(0);
                     let mut low = low0;
                     let mut moved = false;
@@ -4589,7 +4863,9 @@ impl HexedApp {
                                     }
                                 }
                             }
-                            egui::Event::Key { key, pressed: true, .. } => {
+                            egui::Event::Key {
+                                key, pressed: true, ..
+                            } => {
                                 let step = match key {
                                     egui::Key::ArrowRight => 1i64,
                                     egui::Key::ArrowLeft => -1,
@@ -4626,7 +4902,8 @@ impl HexedApp {
                         let hx = ox + x_hex + col as f32 * byte_w;
                         let ax = ox + x_ascii + col as f32 * char_w;
                         let hex_rect = Rect::from_min_size(pos2(hx - 1.0, y), vec2(byte_w, row_h));
-                        let asc_rect = Rect::from_min_size(pos2(ax - 1.0, y), vec2(char_w + 1.0, row_h));
+                        let asc_rect =
+                            Rect::from_min_size(pos2(ax - 1.0, y), vec2(char_w + 1.0, row_h));
                         let strong = egui::Stroke::new(1.5, self.palette.accent);
                         let faint = egui::Stroke::new(1.0, self.palette.faint);
                         painter.rect_stroke(
@@ -4702,11 +4979,10 @@ impl HexedApp {
                 for (off, b) in &edits {
                     d.buffer.overwrite(*off, &[*b]);
                 }
-                // Length is unchanged, so offset-based state stays valid; just
-                // mark the byte-derived views stale (a full re-scan every
-                // keystroke would be too costly — it refreshes on save/reopen).
-                d.strings_dirty = true;
-                d.text_valid = false;
+                // Defer the expensive re-analysis: reset the debounce so it fires
+                // once, shortly after typing stops, instead of every keystroke.
+                // (The text view refreshes immediately via buffer.generation().)
+                d.derived_ttl = EDIT_RESCAN_DELAY;
             }
             if let Some(c) = new_caret {
                 d.sel_anchor = Some(c);
@@ -4732,19 +5008,32 @@ impl HexedApp {
 /// handler can tell "editing bytes in the grid" from "typing in a text field".
 const HEX_GRID_ID: &str = "hexed_hex_grid";
 
+/// Stable egui id for the editable Text-view field. A `TextEdit`'s auto id is
+/// structural (identical across documents, since `draw_text` is one code path),
+/// so its keyboard focus would otherwise persist onto a document the user never
+/// clicked into after a keyboard-driven active-doc change (⌘W / ⌘O). Pinning the
+/// id lets `update()` surrender that focus on every switch, just like the grid.
+const TEXT_EDIT_ID: &str = "hexed_text_edit";
+
+/// Frames of no-typing after a byte edit before the heavy re-analysis (strings,
+/// PE, IOC, YARA, hashes, …) runs. ~0.25 s at 60 fps — long enough to coalesce a
+/// burst of keystrokes into a single rescan, short enough to feel responsive.
+const EDIT_RESCAN_DELAY: u32 = 15;
+
 /// The latest value of the byte at `off` given edits queued this frame (so the
 /// second hex nibble sees the first). Falls back to the buffer's current byte.
 fn latest_byte(edits: &[(usize, u8)], off: usize, data: &[u8]) -> u8 {
-    edits.iter().rev().find(|(o, _)| *o == off).map(|(_, b)| *b).unwrap_or(data[off])
+    edits
+        .iter()
+        .rev()
+        .find(|(o, _)| *o == off)
+        .map(|(_, b)| *b)
+        .unwrap_or(data[off])
 }
 
 /// Render one `.bt` results-tree node. Leaves are clickable (jump to their
 /// bytes); struct/array nodes are collapsible with a jump button in the header.
-fn show_bt_node(
-    ui: &mut egui::Ui,
-    node: &hexed_bt::Node,
-    jump_to: &mut Option<(usize, usize)>,
-) {
+fn show_bt_node(ui: &mut egui::Ui, node: &hexed_bt::Node, jump_to: &mut Option<(usize, usize)>) {
     let sz = node.size.max(1);
     if node.children.is_empty() {
         let text = format!("{}: {} = {}", node.name, node.type_name, node.display);
@@ -4819,7 +5108,9 @@ fn build_pe_report(file_name: &str, data: &[u8], pe: &PeInfo) -> String {
         let _ = writeln!(
             s,
             "PACKED: {}",
-            pe.packer.clone().unwrap_or_else(|| "likely (high entropy)".to_string())
+            pe.packer
+                .clone()
+                .unwrap_or_else(|| "likely (high entropy)".to_string())
         );
     }
     let _ = writeln!(s, "\nSections ({}):", pe.sections.len());
@@ -4827,11 +5118,20 @@ fn build_pe_report(file_name: &str, data: &[u8], pe: &PeInfo) -> String {
         let _ = writeln!(
             s,
             "  {:<8} raw 0x{:<7X} vsize 0x{:<7X} {:<3} entropy {:.2}",
-            sec.name, sec.raw_ptr, sec.virtual_size, sec.perms(), sec.entropy
+            sec.name,
+            sec.raw_ptr,
+            sec.virtual_size,
+            sec.perms(),
+            sec.entropy
         );
     }
     let total: usize = pe.imports.iter().map(|i| i.funcs.len()).sum();
-    let _ = writeln!(s, "\nImports ({} DLLs, {} functions):", pe.imports.len(), total);
+    let _ = writeln!(
+        s,
+        "\nImports ({} DLLs, {} functions):",
+        pe.imports.len(),
+        total
+    );
     for imp in &pe.imports {
         let _ = writeln!(s, "  {}:", imp.dll);
         for f in &imp.funcs {
@@ -4866,7 +5166,11 @@ fn build_triage_report(d: &Document, vt: Option<&vt::VtVerdict>) -> String {
         let _ = writeln!(s, "- imphash: `{}`", d.imphash);
     }
     let overall = shannon_entropy(data);
-    let hi = if overall > 7.2 { "  HIGH (packed/encrypted)" } else { "" };
+    let hi = if overall > 7.2 {
+        "  HIGH (packed/encrypted)"
+    } else {
+        ""
+    };
     let _ = writeln!(s, "- entropy: {overall:.2} bits/byte{hi}");
     // VirusTotal reputation — only when enrichment is opted in and a result exists.
     if let Some(v) = vt {
@@ -4875,7 +5179,11 @@ fn build_triage_report(d: &Document, vt: Option<&vt::VtVerdict>) -> String {
                 let _ = writeln!(s, "- VirusTotal: not seen");
             } else {
                 let det = v.malicious + v.suspicious;
-                let label = v.label.as_deref().map(|l| format!(" · {l}")).unwrap_or_default();
+                let label = v
+                    .label
+                    .as_deref()
+                    .map(|l| format!(" · {l}"))
+                    .unwrap_or_default();
                 let seen = v
                     .first_seen
                     .as_deref()
@@ -4894,13 +5202,20 @@ fn build_triage_report(d: &Document, vt: Option<&vt::VtVerdict>) -> String {
             pe.machine_str(),
             if pe.is_64 { "PE32+" } else { "PE32" }
         );
-        let _ = writeln!(s, "- language: {}   compiler: {}", pe.language(), pe.compiler_str());
+        let _ = writeln!(
+            s,
+            "- language: {}   compiler: {}",
+            pe.language(),
+            pe.compiler_str()
+        );
         let _ = writeln!(s, "- compiled: {}", pe.timestamp_str());
         if pe.is_packed() {
             let _ = writeln!(
                 s,
                 "- **packed**: {}",
-                pe.packer.clone().unwrap_or_else(|| "likely (high entropy)".into())
+                pe.packer
+                    .clone()
+                    .unwrap_or_else(|| "likely (high entropy)".into())
             );
         }
         let _ = writeln!(s, "- sections ({}):", pe.sections.len());
@@ -4984,8 +5299,7 @@ fn entropy_color(e: f32) -> Color32 {
 /// dominant value like 0x00 padding doesn't flatten everything else).
 fn draw_histogram(ui: &mut egui::Ui, hist: &Histogram, pal: &Palette) {
     let height = 84.0;
-    let (rect, _resp) =
-        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let (rect, _resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, pal.bg);
     let max = hist.max_count().max(1) as f32;
@@ -5021,7 +5335,11 @@ fn byte_color(b: u8, p: &Palette) -> Color32 {
 /// Finder-launched `.app` (which has a minimal PATH) still finds Homebrew's upx,
 /// then falls back to the PATH.
 fn upx_command() -> std::process::Command {
-    for p in ["/opt/homebrew/bin/upx", "/usr/local/bin/upx", "/usr/bin/upx"] {
+    for p in [
+        "/opt/homebrew/bin/upx",
+        "/usr/local/bin/upx",
+        "/usr/bin/upx",
+    ] {
         if std::path::Path::new(p).exists() {
             return std::process::Command::new(p);
         }
@@ -5035,7 +5353,12 @@ fn parse_color_hex(s: &str) -> Option<Color32> {
     let byte = |i: usize| u8::from_str_radix(h.get(i..i + 2)?, 16).ok();
     match h.len() {
         6 => Some(Color32::from_rgb(byte(0)?, byte(2)?, byte(4)?)),
-        8 => Some(Color32::from_rgba_unmultiplied(byte(0)?, byte(2)?, byte(4)?, byte(6)?)),
+        8 => Some(Color32::from_rgba_unmultiplied(
+            byte(0)?,
+            byte(2)?,
+            byte(4)?,
+            byte(6)?,
+        )),
         _ => None,
     }
 }
@@ -5044,7 +5367,7 @@ fn parse_color_hex(s: &str) -> Option<Color32> {
 /// Rejects wildcards and odd-length input (a replacement must be exact bytes).
 fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
     let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.is_empty() || cleaned.len() % 2 != 0 || cleaned.contains('?') {
+    if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) || cleaned.contains('?') {
         return None;
     }
     (0..cleaned.len())

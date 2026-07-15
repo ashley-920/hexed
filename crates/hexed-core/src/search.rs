@@ -13,7 +13,7 @@ pub enum PatByte {
 /// Returns `None` for malformed input (odd nibble count or bad hex digit).
 pub fn parse_hex_pattern(s: &str) -> Option<Vec<PatByte>> {
     let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.is_empty() || cleaned.len() % 2 != 0 {
+    if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
         return None;
     }
     let bytes = cleaned.as_bytes();
@@ -91,7 +91,10 @@ mod tests {
     #[test]
     fn parse_with_wildcards() {
         let p = parse_hex_pattern("6A ?? 40").unwrap();
-        assert_eq!(p, vec![PatByte::Byte(0x6A), PatByte::Any, PatByte::Byte(0x40)]);
+        assert_eq!(
+            p,
+            vec![PatByte::Byte(0x6A), PatByte::Any, PatByte::Byte(0x40)]
+        );
         assert!(parse_hex_pattern("6A 4").is_none()); // odd nibbles
         assert!(parse_hex_pattern("XY").is_none()); // bad hex
     }

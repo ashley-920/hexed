@@ -78,7 +78,10 @@ pub fn find_strings(data: &[u8], min_len: usize, ascii: bool, utf16: bool) -> Ve
 }
 
 fn push_ascii(out: &mut Vec<FoundString>, data: &[u8], start: usize, run: usize) {
-    let text: String = data[start..start + run].iter().map(|&b| b as char).collect();
+    let text: String = data[start..start + run]
+        .iter()
+        .map(|&b| b as char)
+        .collect();
     out.push(FoundString {
         offset: start,
         len: run,

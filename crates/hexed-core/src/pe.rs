@@ -2,6 +2,8 @@
 //! to navigate to sections and key headers. Not a validator; every field read
 //! is bounds-checked because it runs on hostile / truncated files.
 
+use std::collections::HashSet;
+
 fn u16le(d: &[u8], o: usize) -> Option<u16> {
     d.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
@@ -21,7 +23,13 @@ fn read_cstr(data: &[u8], off: usize) -> String {
             rest.iter()
                 .take_while(|&&b| b != 0)
                 .take(256)
-                .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '.' })
+                .map(|&b| {
+                    if (0x20..=0x7e).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -33,7 +41,12 @@ fn rva_to_off(sections: &[PeSection], rva: u32) -> Option<usize> {
         let span = s.virtual_size.max(s.raw_size);
         let end = s.virtual_addr.saturating_add(span);
         if rva >= s.virtual_addr && rva < end {
-            return Some((s.raw_ptr + (rva - s.virtual_addr)) as usize);
+            // Compute in usize: `raw_ptr` and `rva - virtual_addr` are both
+            // attacker-controlled u32, so `raw_ptr + delta` in u32 would panic
+            // (debug) / wrap to a bogus small offset (release) on a crafted PE.
+            // A huge-but-valid usize offset is harmless — the bounds-checked
+            // readers (u32le/read_cstr) just return None past EOF.
+            return Some(s.raw_ptr as usize + (rva - s.virtual_addr) as usize);
         }
     }
     None
@@ -154,7 +167,10 @@ impl PeInfo {
         }
         match self.linker_major {
             0 => "unknown".to_string(),
-            2 => format!("GNU ld / MinGW (v{}.{:02})", self.linker_major, self.linker_minor),
+            2 => format!(
+                "GNU ld / MinGW (v{}.{:02})",
+                self.linker_major, self.linker_minor
+            ),
             v => format!("MSVC link v{}.{:02}", v, self.linker_minor),
         }
     }
@@ -300,7 +316,9 @@ fn parse_exports(data: &[u8], sections: &[PeSection], opt: usize, magic: u16) ->
         let rva = u32le(data, funcs_off + ord as usize * 4).unwrap_or(0);
         out.push(PeExport {
             name,
-            ordinal: ordinal_base + ord as u32,
+            // `ordinal_base` is a raw u32 from the file; saturate so a crafted
+            // Base near u32::MAX can't panic (debug) / wrap (release).
+            ordinal: ordinal_base.saturating_add(ord as u32),
             rva,
         });
     }
@@ -325,7 +343,12 @@ pub fn parse_pe(data: &[u8]) -> Option<PeInfo> {
 
     let opt = fh + 20; // optional header
     let magic = u16le(data, opt).unwrap_or(0);
-    let is_64 = magic == 0x20B || matches!(machine, 0x8664 | 0xAA64);
+    // The optional-header layout (and thus EVERY data-directory offset) is set
+    // by Magic alone per the PE spec. A crafted PE can pair a PE32 Magic (0x10B)
+    // with Machine=x64, so keying the data-directory offset off Machine would
+    // read the CLR/resource directories at the wrong place. Keep it magic-only,
+    // consistent with parse_imports/parse_exports; `machine` labels the arch.
+    let is_64 = magic == 0x20B;
     let entry_rva = u32le(data, opt + 16).unwrap_or(0);
     let image_base = if magic == 0x20B {
         u64le(data, opt + 24).unwrap_or(0)
@@ -341,13 +364,20 @@ pub fn parse_pe(data: &[u8]) -> Option<PeInfo> {
         let name: String = name_bytes
             .iter()
             .take_while(|&&b| b != 0)
-            .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..=0x7e).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         let raw_size = u32le(data, s + 16)?;
         let raw_ptr = u32le(data, s + 20)?;
         let start = raw_ptr as usize;
         let end = start.saturating_add(raw_size as usize).min(data.len());
-        let entropy = crate::entropy::shannon_entropy(if start < end { &data[start..end] } else { &[] });
+        let entropy =
+            crate::entropy::shannon_entropy(if start < end { &data[start..end] } else { &[] });
         sections.push(PeSection {
             name,
             virtual_size: u32le(data, s + 8)?,
@@ -408,7 +438,8 @@ pub fn icon_resources(data: &[u8]) -> Vec<Vec<u8>> {
         return out;
     };
     let mut leaves = Vec::new();
-    res_collect_leaves(data, base, type_dir, 0, &mut leaves);
+    let mut seen = HashSet::new();
+    res_collect_leaves(data, base, type_dir, 0, &mut seen, &mut leaves);
     for de in leaves {
         // IMAGE_RESOURCE_DATA_ENTRY: OffsetToData (RVA, u32), Size (u32).
         if let (Some(rva), Some(sz)) = (u32le(data, de), u32le(data, de + 4)) {
@@ -444,8 +475,20 @@ fn res_find_id(data: &[u8], base: usize, dir: usize, want: u32) -> Option<usize>
 }
 
 /// Recursively gather leaf data-entry file offsets under a resource directory.
-fn res_collect_leaves(data: &[u8], base: usize, dir: usize, depth: u32, out: &mut Vec<usize>) {
-    if depth > 4 || out.len() >= 64 {
+fn res_collect_leaves(
+    data: &[u8],
+    base: usize,
+    dir: usize,
+    depth: u32,
+    seen: &mut HashSet<usize>,
+    out: &mut Vec<usize>,
+) {
+    // Cap depth, leaf count, AND revisits. A crafted .rsrc whose subdirectory
+    // entries point back at an ancestor would otherwise recurse ~4096^depth
+    // times — self-referential subdirs never push a leaf, so the leaf cap never
+    // fires — and permanently freeze the UI thread. `seen` bounds total work to
+    // the distinct in-bounds directory offsets, i.e. at most the file size.
+    if depth > 4 || out.len() >= 64 || !seen.insert(dir) {
         return;
     }
     let named = u16le(data, dir + 12).unwrap_or(0) as usize;
@@ -457,7 +500,7 @@ fn res_collect_leaves(data: &[u8], base: usize, dir: usize, depth: u32, out: &mu
         };
         if off & 0x8000_0000 != 0 {
             let sub = base + (off & 0x7FFF_FFFF) as usize;
-            res_collect_leaves(data, base, sub, depth + 1, out);
+            res_collect_leaves(data, base, sub, depth + 1, seen, out);
         } else {
             out.push(base + off as usize);
         }
@@ -479,7 +522,7 @@ pub fn imphash(pe: &PeInfo) -> String {
         // module name; other extensions (.drv, .cpl) are kept, as pefile does.
         let dll = imp.dll.to_ascii_lowercase();
         let dll_stem = match dll.rsplit_once('.') {
-            Some((stem, ext)) if matches!(ext, "dll" | "ocx" | "sys") => stem,
+            Some((stem, "dll" | "ocx" | "sys")) => stem,
             _ => dll.as_str(),
         };
         for f in &imp.funcs {
@@ -516,30 +559,86 @@ pub struct ApiFlag {
 const SUSPICIOUS_APIS: &[(&str, &str, &str)] = &[
     // process injection / execution
     ("virtualalloc", "Injection", "allocate executable memory"),
-    ("virtualallocex", "Injection", "allocate memory in another process"),
-    ("virtualprotect", "Injection", "change memory protection (e.g. make RWX)"),
-    ("virtualprotectex", "Injection", "change memory protection in another process"),
-    ("writeprocessmemory", "Injection", "write into another process"),
-    ("readprocessmemory", "Injection", "read another process's memory"),
-    ("createremotethread", "Injection", "run code in another process"),
-    ("createremotethreadex", "Injection", "run code in another process"),
-    ("ntcreatethreadex", "Injection", "stealthy remote thread creation"),
+    (
+        "virtualallocex",
+        "Injection",
+        "allocate memory in another process",
+    ),
+    (
+        "virtualprotect",
+        "Injection",
+        "change memory protection (e.g. make RWX)",
+    ),
+    (
+        "virtualprotectex",
+        "Injection",
+        "change memory protection in another process",
+    ),
+    (
+        "writeprocessmemory",
+        "Injection",
+        "write into another process",
+    ),
+    (
+        "readprocessmemory",
+        "Injection",
+        "read another process's memory",
+    ),
+    (
+        "createremotethread",
+        "Injection",
+        "run code in another process",
+    ),
+    (
+        "createremotethreadex",
+        "Injection",
+        "run code in another process",
+    ),
+    (
+        "ntcreatethreadex",
+        "Injection",
+        "stealthy remote thread creation",
+    ),
     ("queueuserapc", "Injection", "APC injection"),
     ("ntunmapviewofsection", "Injection", "process hollowing"),
-    ("ntmapviewofsection", "Injection", "section-mapping injection"),
-    ("setthreadcontext", "Injection", "hijack a thread's execution"),
-    ("openprocess", "Injection", "obtain a handle to another process"),
+    (
+        "ntmapviewofsection",
+        "Injection",
+        "section-mapping injection",
+    ),
+    (
+        "setthreadcontext",
+        "Injection",
+        "hijack a thread's execution",
+    ),
+    (
+        "openprocess",
+        "Injection",
+        "obtain a handle to another process",
+    ),
     ("createprocess", "Execution", "spawn a process"),
-    ("createprocessinternal", "Execution", "spawn a process (internal)"),
+    (
+        "createprocessinternal",
+        "Execution",
+        "spawn a process (internal)",
+    ),
     ("shellexecute", "Execution", "launch a file/URL"),
     ("winexec", "Execution", "legacy process launch"),
     ("system", "Execution", "run a shell command"),
     // dynamic resolution
     ("loadlibrary", "Dynamic API", "load a DLL at runtime"),
     ("loadlibraryex", "Dynamic API", "load a DLL at runtime"),
-    ("getprocaddress", "Dynamic API", "resolve an API by name (evasion)"),
+    (
+        "getprocaddress",
+        "Dynamic API",
+        "resolve an API by name (evasion)",
+    ),
     ("ldrloaddll", "Dynamic API", "low-level DLL load"),
-    ("ldrgetprocedureaddress", "Dynamic API", "low-level API resolve"),
+    (
+        "ldrgetprocedureaddress",
+        "Dynamic API",
+        "low-level API resolve",
+    ),
     // persistence
     ("regsetvalue", "Persistence", "write a registry value"),
     ("regsetvalueex", "Persistence", "write a registry value"),
@@ -556,18 +655,46 @@ const SUSPICIOUS_APIS: &[(&str, &str, &str)] = &[
     ("bitblt", "Spying", "screen capture"),
     ("getclipboarddata", "Spying", "read the clipboard"),
     // privilege / token
-    ("adjusttokenprivileges", "Privilege", "enable privileges (e.g. SeDebug)"),
-    ("lookupprivilegevalue", "Privilege", "look up a privilege LUID"),
+    (
+        "adjusttokenprivileges",
+        "Privilege",
+        "enable privileges (e.g. SeDebug)",
+    ),
+    (
+        "lookupprivilegevalue",
+        "Privilege",
+        "look up a privilege LUID",
+    ),
     ("openprocesstoken", "Privilege", "open a process token"),
     // anti-analysis
     ("isdebuggerpresent", "Anti-analysis", "debugger check"),
-    ("checkremotedebuggerpresent", "Anti-analysis", "debugger check"),
-    ("ntqueryinformationprocess", "Anti-analysis", "debugger/enum check"),
-    ("outputdebugstring", "Anti-analysis", "debugger trick/timing"),
+    (
+        "checkremotedebuggerpresent",
+        "Anti-analysis",
+        "debugger check",
+    ),
+    (
+        "ntqueryinformationprocess",
+        "Anti-analysis",
+        "debugger/enum check",
+    ),
+    (
+        "outputdebugstring",
+        "Anti-analysis",
+        "debugger trick/timing",
+    ),
     ("gettickcount", "Anti-analysis", "timing/sandbox check"),
-    ("queryperformancecounter", "Anti-analysis", "timing/sandbox check"),
+    (
+        "queryperformancecounter",
+        "Anti-analysis",
+        "timing/sandbox check",
+    ),
     ("sleep", "Anti-analysis", "stall to evade sandboxes"),
-    ("createtoolhelp32snapshot", "Discovery", "enumerate processes"),
+    (
+        "createtoolhelp32snapshot",
+        "Discovery",
+        "enumerate processes",
+    ),
     ("process32first", "Discovery", "enumerate processes"),
     ("process32next", "Discovery", "enumerate processes"),
     // networking / download
@@ -701,8 +828,14 @@ mod tests {
         // pefile's imphash of {KERNEL32.dll: [CreateFileA], USER32.dll: [MessageBoxA]}
         // is md5("kernel32.createfilea,user32.messageboxa").
         let pe = pe_with_imports(vec![
-            PeImport { dll: "KERNEL32.dll".into(), funcs: vec!["CreateFileA".into()] },
-            PeImport { dll: "USER32.dll".into(), funcs: vec!["MessageBoxA".into()] },
+            PeImport {
+                dll: "KERNEL32.dll".into(),
+                funcs: vec!["CreateFileA".into()],
+            },
+            PeImport {
+                dll: "USER32.dll".into(),
+                funcs: vec!["MessageBoxA".into()],
+            },
         ]);
         let expected = crate::hashes::md5_hex(b"kernel32.createfilea,user32.messageboxa");
         assert_eq!(imphash(&pe), expected);
@@ -725,7 +858,10 @@ mod tests {
             dll: "WINSPOOL.DRV".into(),
             funcs: vec!["OpenPrinterW".into(), String::new()],
         }]);
-        assert_eq!(imphash(&pe), crate::hashes::md5_hex(b"winspool.drv.openprinterw"));
+        assert_eq!(
+            imphash(&pe),
+            crate::hashes::md5_hex(b"winspool.drv.openprinterw")
+        );
     }
 
     #[test]

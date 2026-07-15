@@ -12,7 +12,9 @@ pub struct YaraMatch {
 pub fn yara_scan(source: &str, data: &[u8]) -> Result<Vec<YaraMatch>, String> {
     let rules = yara_x::compile(source).map_err(|e| e.to_string())?;
     let mut scanner = yara_x::Scanner::new(&rules);
-    let results = scanner.scan(data).map_err(|e| format!("scan error: {e:?}"))?;
+    let results = scanner
+        .scan(data)
+        .map_err(|e| format!("scan error: {e:?}"))?;
     let mut out = Vec::new();
     for r in results.matching_rules() {
         let mut locations = Vec::new();
@@ -45,9 +47,11 @@ mod tests {
 
     #[test]
     fn no_match_and_bad_rule() {
-        assert!(yara_scan(r#"rule x { strings: $a = "zzz" condition: $a }"#, b"abc")
-            .unwrap()
-            .is_empty());
+        assert!(
+            yara_scan(r#"rule x { strings: $a = "zzz" condition: $a }"#, b"abc")
+                .unwrap()
+                .is_empty()
+        );
         assert!(yara_scan("not a valid rule", b"abc").is_err());
     }
 }

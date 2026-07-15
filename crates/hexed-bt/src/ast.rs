@@ -8,13 +8,39 @@ pub enum Expr {
     Char(char),
     Ident(String),
     /// Prefix (`!x`, `-x`, `++x`) or postfix (`x++`) unary op.
-    Unary { op: &'static str, prefix: bool, expr: Box<Expr> },
-    Binary { op: &'static str, lhs: Box<Expr>, rhs: Box<Expr> },
-    Ternary { cond: Box<Expr>, then_: Box<Expr>, else_: Box<Expr> },
-    Assign { op: &'static str, target: Box<Expr>, value: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<Expr> },
-    Index { base: Box<Expr>, index: Box<Expr> },
-    Member { base: Box<Expr>, name: String, arrow: bool },
+    Unary {
+        op: &'static str,
+        prefix: bool,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: &'static str,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Ternary {
+        cond: Box<Expr>,
+        then_: Box<Expr>,
+        else_: Box<Expr>,
+    },
+    Assign {
+        op: &'static str,
+        target: Box<Expr>,
+        value: Box<Expr>,
+    },
+    Call {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
+    Member {
+        base: Box<Expr>,
+        name: String,
+        arrow: bool,
+    },
     Sizeof(Box<Expr>),
 }
 
@@ -88,7 +114,12 @@ pub enum Decl {
     Var(VarDecl),
     Struct(StructDef),
     Enum(EnumDef),
-    Typedef { ty: TypeRef, name: String, array: ArraySize, attrs: Attrs },
+    Typedef {
+        ty: TypeRef,
+        name: String,
+        array: ArraySize,
+        attrs: Attrs,
+    },
     Func(FuncDef),
 }
 
@@ -97,10 +128,25 @@ pub enum Stmt {
     Expr(Expr),
     Decl(Decl),
     Block(Vec<Stmt>),
-    If { cond: Expr, then_: Box<Stmt>, else_: Option<Box<Stmt>> },
-    For { init: Option<Box<Stmt>>, cond: Option<Expr>, step: Option<Expr>, body: Box<Stmt> },
-    While { cond: Expr, body: Box<Stmt> },
-    DoWhile { body: Box<Stmt>, cond: Expr },
+    If {
+        cond: Expr,
+        then_: Box<Stmt>,
+        else_: Option<Box<Stmt>>,
+    },
+    For {
+        init: Option<Box<Stmt>>,
+        cond: Option<Expr>,
+        step: Option<Expr>,
+        body: Box<Stmt>,
+    },
+    While {
+        cond: Expr,
+        body: Box<Stmt>,
+    },
+    DoWhile {
+        body: Box<Stmt>,
+        cond: Expr,
+    },
     Return(Option<Expr>),
     Break,
     Continue,

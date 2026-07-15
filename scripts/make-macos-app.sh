@@ -62,16 +62,25 @@ ${ICON_PLIST}
             <key>CFBundleTypeName</key><string>Any file</string>
             <key>CFBundleTypeRole</key><string>Viewer</string>
             <key>LSHandlerRank</key><string>Alternate</string>
-            <!-- Cover every file. public.executable must be listed explicitly:
-                 macOS special-cases executables (.exe/.dll/Mach-O) and refuses a
-                 generic public.data-only handler at open time even though it lists
-                 it in the menu. public.content/data/item cover documents & blobs. -->
+            <!-- Cover every file. Several abstract UTIs are special-cased by
+                 macOS: it lists a generic public.data-only handler in the menu
+                 but REFUSES it at open time ("cannot open files in the X format")
+                 for executables, text, source code, images, A/V, and archives.
+                 Declare those umbrella types explicitly so "Open With -> Hexed"
+                 actually opens them; public.content/data/item cover the rest
+                 (documents & arbitrary blobs). -->
             <key>LSItemContentTypes</key>
             <array>
                 <string>public.item</string>
                 <string>public.content</string>
                 <string>public.data</string>
                 <string>public.executable</string>
+                <string>public.text</string>
+                <string>public.plain-text</string>
+                <string>public.source-code</string>
+                <string>public.image</string>
+                <string>public.audiovisual-content</string>
+                <string>public.archive</string>
             </array>
         </dict>
     </array>

@@ -18,7 +18,11 @@ const MAX_CONTEXT: usize = 48 * 1024;
 /// Locate the `codex` binary. A Finder-launched `.app` has a minimal PATH, so
 /// check the usual install locations before falling back to PATH.
 fn codex_bin() -> std::path::PathBuf {
-    for p in ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", "/usr/bin/codex"] {
+    for p in [
+        "/opt/homebrew/bin/codex",
+        "/usr/local/bin/codex",
+        "/usr/bin/codex",
+    ] {
         if std::path::Path::new(p).exists() {
             return std::path::PathBuf::from(p);
         }
@@ -121,7 +125,13 @@ impl Ai {
     /// Launch a `codex exec` run with `instructions` and piped `context`.
     /// `write` selects the sandbox (workspace-write vs read-only). No-op if a
     /// run is already in flight.
-    pub fn run(&mut self, label: impl Into<String>, instructions: String, context: String, write: bool) {
+    pub fn run(
+        &mut self,
+        label: impl Into<String>,
+        instructions: String,
+        context: String,
+        write: bool,
+    ) {
         if self.running {
             return;
         }
@@ -142,7 +152,11 @@ fn run_codex(instructions: &str, context: &str, allow_write: bool) -> AiEvent {
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-s")
-        .arg(if allow_write { "workspace-write" } else { "read-only" })
+        .arg(if allow_write {
+            "workspace-write"
+        } else {
+            "read-only"
+        })
         .arg("--output-last-message")
         .arg(&out_file);
     // Mirror the `codex-work` shell function's separate CODEX_HOME.
@@ -164,12 +178,16 @@ fn run_codex(instructions: &str, context: &str, allow_write: bool) -> AiEvent {
     };
 
     if let Some(mut si) = child.stdin.take() {
-        let mut ctx = context.as_bytes();
-        if ctx.len() > MAX_CONTEXT {
-            ctx = &ctx[..MAX_CONTEXT];
-        }
-        let _ = si.write_all(ctx);
-        // `si` drops here, closing stdin so the agent sees EOF.
+        let mut ctx = context.as_bytes().to_vec();
+        ctx.truncate(MAX_CONTEXT);
+        // Write stdin on a separate thread. Writing it inline would deadlock a
+        // child that fills its stdout/stderr pipe before it finishes draining
+        // stdin: it blocks on stdout while we block on stdin. Letting the writer
+        // run concurrently with wait_with_output (which drains stdout) avoids it.
+        // The thread drops `si` when done, closing stdin so codex sees EOF.
+        std::thread::spawn(move || {
+            let _ = si.write_all(&ctx);
+        });
     }
 
     let output = match child.wait_with_output() {

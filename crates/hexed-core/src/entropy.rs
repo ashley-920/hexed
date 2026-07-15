@@ -26,7 +26,11 @@ pub fn entropy_profile(data: &[u8], samples: usize) -> Vec<f32> {
     if data.is_empty() || samples == 0 {
         return Vec::new();
     }
-    let chunk = data.len().div_ceil(samples);
+    // Never let a chunk shrink below a real entropy window: a 1-byte chunk has
+    // entropy 0, so a small packed/encrypted file downsampled into more samples
+    // than it has bytes would render as all-"low" (blue) — inverting the triage
+    // signal. 64 bytes is enough for random data to read as clearly high.
+    let chunk = data.len().div_ceil(samples).max(64);
     let mut out = Vec::with_capacity(samples);
     let mut i = 0;
     while i < data.len() {

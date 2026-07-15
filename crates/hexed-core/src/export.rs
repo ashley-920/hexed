@@ -108,14 +108,19 @@ pub fn to_c_array(data: &[u8], name: &str) -> String {
 /// everything else shown as '.', matching the hex view's ASCII pane.
 pub fn to_text(data: &[u8]) -> String {
     data.iter()
-        .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '.' })
+        .map(|&b| {
+            if (0x20..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
         .collect()
 }
 
 /// Standard base64 (RFC 4648, with `=` padding).
 pub fn to_base64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -144,7 +149,10 @@ mod tests_yara {
 
     #[test]
     fn magic_by_type() {
-        assert_eq!(yara_file_magic(b"MZ\x90\x00"), Some("uint16be(0) == 0x4D5A"));
+        assert_eq!(
+            yara_file_magic(b"MZ\x90\x00"),
+            Some("uint16be(0) == 0x4D5A")
+        );
         assert_eq!(
             yara_file_magic(&[0x7F, b'E', b'L', b'F']),
             Some("uint32be(0) == 0x7F454C46")

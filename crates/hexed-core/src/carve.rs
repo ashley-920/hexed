@@ -16,7 +16,11 @@ pub struct Embedded {
 }
 
 /// Upper bound on reported hits, so a pathological file can't flood the UI.
-const MAX_HITS: usize = 512;
+// Cap on carved hits. The scan is front-to-back and stops at the cap, so a low
+// cap lets many junk matches near the start hide a real payload deeper in the
+// file; keep it high enough that realistic samples (lots of resources / small
+// magics) are never truncated, while still bounding memory on a hostile flood.
+const MAX_HITS: usize = 4096;
 
 /// Find embedded files by magic. Results are sorted by offset. The match at
 /// offset 0 (the container's own header) is included and labeled like any other.
@@ -55,20 +59,36 @@ pub fn find_embedded(data: &[u8]) -> Vec<Embedded> {
         // MZ → validate to PE\0\0.
         if data[i] == b'M' && i + 1 < n && data[i + 1] == b'Z' {
             if let Some(size) = validate_pe(data, i) {
-                out.push(Embedded { kind: "PE/EXE", offset: i, size });
+                out.push(Embedded {
+                    kind: "PE/EXE",
+                    offset: i,
+                    size,
+                });
                 continue;
             }
         }
         // JPEG: FF D8 FF.
         if i + 3 <= n && data[i] == 0xFF && data[i + 1] == 0xD8 && data[i + 2] == 0xFF {
-            out.push(Embedded { kind: "JPEG", offset: i, size: None });
+            out.push(Embedded {
+                kind: "JPEG",
+                offset: i,
+                size: None,
+            });
             continue;
         }
         for (magic, kind) in SIGS {
             if data[i..].starts_with(magic) {
                 // TAR "ustar" lives at offset 257 of a block; report the block start.
-                let off = if *kind == "TAR" && i >= 257 { i - 257 } else { i };
-                out.push(Embedded { kind, offset: off, size: None });
+                let off = if *kind == "TAR" && i >= 257 {
+                    i - 257
+                } else {
+                    i
+                };
+                out.push(Embedded {
+                    kind,
+                    offset: off,
+                    size: None,
+                });
                 break;
             }
         }
@@ -87,7 +107,8 @@ fn validate_pe(data: &[u8], at: usize) -> Option<Option<usize>> {
     if e_lfanew_pos + 4 > data.len() {
         return None;
     }
-    let e_lfanew = u32::from_le_bytes(data[e_lfanew_pos..e_lfanew_pos + 4].try_into().ok()?) as usize;
+    let e_lfanew =
+        u32::from_le_bytes(data[e_lfanew_pos..e_lfanew_pos + 4].try_into().ok()?) as usize;
     let pe = at.checked_add(e_lfanew)?;
     if pe + 24 > data.len() || &data[pe..pe + 4] != b"PE\0\0" {
         return None;
@@ -107,7 +128,11 @@ fn validate_pe(data: &[u8], at: usize) -> Option<Option<usize>> {
         end = end.max(raw_ptr + raw_size);
     }
     // size is relative to the PE's own start (`at`); clamp to buffer.
-    let size = if end > 0 { Some(end.min(data.len().saturating_sub(at))) } else { None };
+    let size = if end > 0 {
+        Some(end.min(data.len().saturating_sub(at)))
+    } else {
+        None
+    };
     Some(size)
 }
 
@@ -145,6 +170,9 @@ mod tests {
         data.extend_from_slice(b"PE\0\0"); // 64..68
         data.extend_from_slice(&[0u8; 20]); // COFF header rest (num_sections=0 at +6)
         let hits = find_embedded(&data);
-        assert!(hits.iter().any(|e| e.kind == "PE/EXE" && e.offset == 0), "got {hits:?}");
+        assert!(
+            hits.iter().any(|e| e.kind == "PE/EXE" && e.offset == 0),
+            "got {hits:?}"
+        );
     }
 }

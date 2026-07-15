@@ -34,7 +34,9 @@ pub fn apply(op: BlockOp, data: &mut [u8]) {
         BlockOp::Or(k) => data.iter_mut().for_each(|b| *b |= k),
         BlockOp::Xor(k) => data.iter_mut().for_each(|b| *b ^= k),
         BlockOp::Not => data.iter_mut().for_each(|b| *b = !*b),
-        BlockOp::Neg => data.iter_mut().for_each(|b| *b = (*b as i8).wrapping_neg() as u8),
+        BlockOp::Neg => data
+            .iter_mut()
+            .for_each(|b| *b = (*b as i8).wrapping_neg() as u8),
         BlockOp::Rol(n) => {
             let n = n % 8;
             data.iter_mut().for_each(|b| *b = b.rotate_left(n));
