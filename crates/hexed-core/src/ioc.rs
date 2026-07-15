@@ -206,7 +206,13 @@ fn scan_ipv4(t: &[u8], push: &mut impl FnMut(IocKind, String, usize)) {
         // reject if part of a longer dotted-number run (versions), and reject
         // x.0.0.0 / 0.0.0.0 which are almost always version/netmask artifacts.
         let preceded = start > 0 && t[start - 1] == b'.';
-        let followed = j < n && (t[j] == b'.' || t[j].is_ascii_digit());
+        // Reject only a genuine longer dotted-number run (a 5th octet / version
+        // like 1.2.3.4.5), i.e. a following digit, or a dot that is itself
+        // followed by a digit. A trailing '.' that's sentence punctuation
+        // ("the C2 is 1.2.3.4.") must NOT discard an otherwise-valid IP.
+        let followed = j < n
+            && (t[j].is_ascii_digit()
+                || (t[j] == b'.' && j + 1 < n && t[j + 1].is_ascii_digit()));
         let trailing_zero = octets[1] == 0 && octets[2] == 0 && octets[3] == 0;
         if ok && count == 4 && !preceded && !followed && !trailing_zero {
             push(IocKind::Ipv4, ascii(&t[start..j]), start);

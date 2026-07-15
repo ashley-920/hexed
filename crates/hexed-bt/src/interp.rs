@@ -158,8 +158,10 @@ const STEP_BUDGET: u64 = 10_000_000;
 
 /// Max nesting depth when expanding a type (struct/array) against the data. A
 /// self-referential or mutually-recursive struct that consumes no bytes would
-/// otherwise recurse until the thread stack aborts the process.
-const MAX_TYPE_DEPTH: u32 = 256;
+/// otherwise recurse until the thread stack aborts the process (uncatchable).
+/// Each level costs several large interpreter frames, so keep this well within a
+/// 2 MB worker-thread stack; real templates nest only a handful deep.
+const MAX_TYPE_DEPTH: u32 = 64;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -1333,6 +1335,37 @@ mod tests {
 
     fn run_ok(src: &str, data: &[u8]) -> Template {
         run(src, data).unwrap()
+    }
+
+    #[test]
+    fn deep_expression_nesting_is_rejected_not_a_stack_overflow() {
+        // Before the parser depth cap this overflowed the thread stack — an
+        // uncatchable process abort. It must now return an error and not crash.
+        let src = format!("x = {}1{};", "(".repeat(5000), ")".repeat(5000));
+        let toks = crate::lexer::tokenize(&src).unwrap();
+        assert!(crate::parser::parse(&toks).is_err());
+    }
+
+    #[test]
+    fn recursive_struct_is_rejected_not_a_stack_overflow() {
+        // `struct A` whose only member is another `A` consumes no bytes, so it
+        // would recurse until the stack aborts; the type-depth cap makes it err.
+        assert!(run("struct A { A a; }; A x;", &[0u8; 16]).is_err());
+    }
+
+    #[test]
+    fn zero_width_array_element_is_rejected_not_an_oom() {
+        // An empty struct reads 0 bytes, so a huge array of it would allocate
+        // `count` empty nodes forever; it must be rejected instead of hanging.
+        assert!(run("struct E { }; E arr[100000000];", &[0u8; 16]).is_err());
+    }
+
+    #[test]
+    fn hostile_builtin_args_do_not_panic_or_hang() {
+        // Negative/huge positions and lengths must be clamped, not panic or hang.
+        let data = [1u8, 2, 3, 4];
+        assert!(run("local int a = ReadByte(-1);", &data).is_ok());
+        assert!(run("local int a = Memcmp(0, 0, 999999999999);", &data).is_ok());
     }
 
     #[test]

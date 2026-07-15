@@ -22,9 +22,10 @@ impl std::fmt::Display for ParseError {
 /// untrusted (opened files, AI-generated), and this is a plain recursive-descent
 /// parser: without a cap, deep nesting (`((((…))))`, `!!!!…`, `{{{{…}}}}`)
 /// overflows the thread stack, which in Rust is an uncatchable process ABORT.
-/// A few hundred is far more nesting than any real template and stays well under
-/// the ~1500–2000 that overflows an 8 MB stack.
-const MAX_PARSE_DEPTH: u32 = 256;
+/// The cap must trip well before the stack is exhausted even on a 2 MB worker
+/// thread (several parser frames per nesting level); 64 is still far more nesting
+/// than any real template.
+const MAX_PARSE_DEPTH: u32 = 64;
 
 pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
     let mut p = Parser { toks: tokens, pos: 0, depth: 0 };
