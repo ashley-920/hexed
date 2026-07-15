@@ -949,6 +949,17 @@ impl HexedApp {
         if self.active >= self.docs.len() {
             self.active = self.docs.len().saturating_sub(1);
         }
+        // YARA "scan all" results hold absolute doc indices used for click-to-
+        // jump; drop the closed doc's group and shift the rest so a later click
+        // still lands on the right file instead of a shifted-in one.
+        if let Some(groups) = &mut self.yara_result {
+            groups.retain(|(di, _, _)| *di != i);
+            for (di, _, _) in groups.iter_mut() {
+                if *di > i {
+                    *di -= 1;
+                }
+            }
+        }
     }
 }
 
@@ -4449,11 +4460,18 @@ impl HexedApp {
                     // frames to win that race and land on the match.
                     if let Some((off, len)) = d.text_reveal {
                         if d.text_reveal_ttl > 0 {
-                            let s = char_boundary_floor(&d.text_buf, off);
-                            let e = char_boundary_floor(&d.text_buf, off.saturating_add(len));
-                            let cstart = d.text_buf[..s].chars().count();
-                            let cend = d.text_buf[..e].chars().count();
+                            // Only map the byte offset in the editable view. There
+                            // text_buf is the file verbatim (valid UTF-8), so byte
+                            // offsets line up 1:1. The read-only view decodes with
+                            // from_utf8_lossy, which inserts multi-byte U+FFFD for
+                            // each bad byte, so `off` wouldn't map — reveal would
+                            // scroll to the wrong place. Binaries: use the hex view.
                             if editable {
+                                let s = char_boundary_floor(&d.text_buf, off);
+                                let e =
+                                    char_boundary_floor(&d.text_buf, off.saturating_add(len));
+                                let cstart = d.text_buf[..s].chars().count();
+                                let cend = d.text_buf[..e].chars().count();
                                 let mut st = out.state;
                                 st.set_ccursor_range(Some(egui::text::CCursorRange::two(
                                     egui::text::CCursor::new(cstart),
@@ -4461,12 +4479,12 @@ impl HexedApp {
                                 )));
                                 st.store(ui.ctx(), egui::Id::new(TEXT_EDIT_ID));
                                 ui.memory_mut(|m| m.request_focus(egui::Id::new(TEXT_EDIT_ID)));
+                                let caret = out
+                                    .galley
+                                    .pos_from_ccursor(egui::text::CCursor::new(cstart))
+                                    .translate(out.galley_pos.to_vec2());
+                                ui.scroll_to_rect(caret.expand(24.0), Some(egui::Align::Center));
                             }
-                            let caret = out
-                                .galley
-                                .pos_from_ccursor(egui::text::CCursor::new(cstart))
-                                .translate(out.galley_pos.to_vec2());
-                            ui.scroll_to_rect(caret.expand(24.0), Some(egui::Align::Center));
                             d.text_reveal_ttl -= 1;
                             if d.text_reveal_ttl == 0 {
                                 d.text_reveal = None;
@@ -4498,6 +4516,11 @@ impl HexedApp {
                 d.buffer.replace_all(bytes);
                 d.text_dirty = false;
                 invalidate_derived(d);
+                // A text edit rewrites the whole buffer and can change its length,
+                // so byte-offset bookmarks past the new end are now invalid — drop
+                // them rather than let them jump past EOF.
+                let len = d.buffer.len();
+                d.bookmarks.retain(|(b, _)| *b < len);
                 // text_buf already equals the just-written buffer, so record its
                 // generation to avoid a redundant rebuild next frame.
                 d.text_gen = d.buffer.generation();

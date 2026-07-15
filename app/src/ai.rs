@@ -164,12 +164,16 @@ fn run_codex(instructions: &str, context: &str, allow_write: bool) -> AiEvent {
     };
 
     if let Some(mut si) = child.stdin.take() {
-        let mut ctx = context.as_bytes();
-        if ctx.len() > MAX_CONTEXT {
-            ctx = &ctx[..MAX_CONTEXT];
-        }
-        let _ = si.write_all(ctx);
-        // `si` drops here, closing stdin so the agent sees EOF.
+        let mut ctx = context.as_bytes().to_vec();
+        ctx.truncate(MAX_CONTEXT);
+        // Write stdin on a separate thread. Writing it inline would deadlock a
+        // child that fills its stdout/stderr pipe before it finishes draining
+        // stdin: it blocks on stdout while we block on stdin. Letting the writer
+        // run concurrently with wait_with_output (which drains stdout) avoids it.
+        // The thread drops `si` when done, closing stdin so codex sees EOF.
+        std::thread::spawn(move || {
+            let _ = si.write_all(&ctx);
+        });
     }
 
     let output = match child.wait_with_output() {

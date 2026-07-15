@@ -134,6 +134,12 @@ impl Vt {
     /// Kick off an Intelligence search for how many files share `dhash` (one at
     /// a time; no-op if keyless, cached, or already in flight).
     pub fn request_icon(&mut self, dhash: &str) {
+        // Mirror request(): never touch the network unless enrichment is
+        // explicitly enabled. An icon Intelligence search discloses to VT that
+        // we're analysing this sample, so the opt-in gate must apply here too.
+        if !self.enabled {
+            return;
+        }
         let Some(key) = self.key.clone() else { return };
         let d = dhash.trim().to_string();
         if d.is_empty() || self.icon_cache.contains_key(&d) || self.icon_inflight.is_some() {
@@ -209,14 +215,17 @@ fn parse(resp: ureq::Response) -> VtVerdict {
     let suspicious = g("suspicious");
     let harmless = g("harmless");
     let undetected = g("undetected");
+    // Saturating: a hostile/malformed VT response could set these near u32::MAX
+    // and overflow-panic (debug) / wrap to a tiny total (release), skewing the
+    // detection ratio.
     let total = malicious
-        + suspicious
-        + harmless
-        + undetected
-        + g("timeout")
-        + g("type-unsupported")
-        + g("failure")
-        + g("confirmed-timeout");
+        .saturating_add(suspicious)
+        .saturating_add(harmless)
+        .saturating_add(undetected)
+        .saturating_add(g("timeout"))
+        .saturating_add(g("type-unsupported"))
+        .saturating_add(g("failure"))
+        .saturating_add(g("confirmed-timeout"));
     let label = attr["popular_threat_classification"]["suggested_threat_label"]
         .as_str()
         .filter(|s| !s.is_empty())
