@@ -17,20 +17,37 @@ pub fn parse_key(s: &str) -> Option<Vec<u8>> {
 }
 
 fn parse_hex_key(s: &str) -> Option<Vec<u8>> {
-    let cleaned: String = s
-        .replace("0x", "")
-        .replace("0X", "")
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != ',')
+    // When the user separated the bytes ("6A 40", "0x6A,0x40", "A B"), each
+    // group is ONE byte (1–2 hex digits). The old code stripped all separators
+    // and re-paired the digits, so "A B" (meant 0x0A 0x0B) became 0xAB — a
+    // silently wrong key and thus a wrong decode.
+    let groups: Vec<&str> = s
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|g| !g.is_empty())
         .collect();
-    if cleaned.is_empty() || cleaned.len() % 2 != 0 {
+    let strip0x = |g: &str| -> String {
+        g.strip_prefix("0x").or_else(|| g.strip_prefix("0X")).unwrap_or(g).to_string()
+    };
+    if groups.len() > 1 {
+        let mut out = Vec::with_capacity(groups.len());
+        for g in groups {
+            let g = strip0x(g);
+            if g.is_empty() || g.len() > 2 || !g.chars().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            out.push(u8::from_str_radix(&g, 16).ok()?);
+        }
+        return Some(out);
+    }
+
+    // A single contiguous token: strip an optional 0x, then require an even
+    // number of hex digits and pair them ("6a40" -> [0x6A, 0x40]).
+    let g = strip0x(groups.first().copied().unwrap_or(""));
+    let bytes = g.as_bytes();
+    if bytes.is_empty() || bytes.len() % 2 != 0 || !g.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    if !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let bytes = cleaned.as_bytes();
-    let mut out = Vec::with_capacity(cleaned.len() / 2);
+    let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut i = 0;
     while i < bytes.len() {
         let hi = (bytes[i] as char).to_digit(16)?;
@@ -90,7 +107,9 @@ pub fn brute_force_single_byte(src: &[u8]) -> Vec<ScoredKey> {
     if src.is_empty() {
         return scored;
     }
-    let denom = (src.len() as i32 * MAX_WEIGHT) as f32;
+    // Compute in f32: `src.len() as i32 * MAX_WEIGHT` overflows i32 for a very
+    // large slice (panic in debug, wrong denom in release).
+    let denom = src.len() as f32 * MAX_WEIGHT as f32;
     for k in 0u16..256 {
         let key = k as u8;
         let sum: i32 = src.iter().map(|&b| text_weight(b ^ key)).sum();
@@ -111,6 +130,11 @@ mod tests {
         assert_eq!(parse_key("6a40"), Some(vec![0x6A, 0x40]));
         assert_eq!(parse_key("0x6A,0x40"), Some(vec![0x6A, 0x40]));
         assert_eq!(parse_key(""), None);
+        // Separated single-digit groups are byte boundaries, not digits to pair:
+        // "A B" is 0x0A 0x0B, NOT 0xAB.
+        assert_eq!(parse_key("A B"), Some(vec![0x0A, 0x0B]));
+        assert_eq!(parse_key("1 2 3 4"), Some(vec![1, 2, 3, 4]));
+        assert_eq!(parse_key("0x1,0x2,0x3"), Some(vec![1, 2, 3]));
     }
 
     #[test]

@@ -16,7 +16,11 @@ pub struct Embedded {
 }
 
 /// Upper bound on reported hits, so a pathological file can't flood the UI.
-const MAX_HITS: usize = 512;
+// Cap on carved hits. The scan is front-to-back and stops at the cap, so a low
+// cap lets many junk matches near the start hide a real payload deeper in the
+// file; keep it high enough that realistic samples (lots of resources / small
+// magics) are never truncated, while still bounding memory on a hostile flood.
+const MAX_HITS: usize = 4096;
 
 /// Find embedded files by magic. Results are sorted by offset. The match at
 /// offset 0 (the container's own header) is included and labeled like any other.
