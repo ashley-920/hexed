@@ -220,6 +220,15 @@ struct Document {
     /// Frames remaining to keep re-applying `scroll_to` (lets egui's scroll
     /// settle on a huge virtualized buffer instead of missing on one frame).
     scroll_ttl: u8,
+    /// A pending "reveal this byte range in the Text view" request (offset, len),
+    /// set by `goto` alongside the hex scroll/selection. The hex grid uses
+    /// `scroll_to`/`sel_*`; the Text view consumes this to scroll + select the
+    /// match, so Find / Goto / click-to-jump work in Text view too.
+    text_reveal: Option<(usize, usize)>,
+    /// Frames left to keep re-applying `text_reveal`. Focusing the field makes
+    /// egui scroll the whole widget to the top; re-asserting our scroll for a few
+    /// frames wins that race and lands on the match (mirrors `scroll_ttl`).
+    text_reveal_ttl: u8,
     /// Parsed PE structure, if this file is a PE (cached; recomputed on edit).
     pe: Option<PeInfo>,
     /// Named offset bookmarks for this file.
@@ -261,17 +270,23 @@ struct Document {
     yara_lib_errors: Vec<(String, String)>,
     /// SHA-256 of the whole file (cached; used for VirusTotal lookups).
     file_sha256: String,
-    /// Editable text-view buffer (the file decoded as UTF-8-lossy). Refreshed
-    /// from `buffer` when `text_valid` is false (i.e. after an out-of-view edit).
+    /// Editable text-view buffer (the file decoded as UTF-8-lossy). Rebuilt from
+    /// `buffer` whenever `buffer.generation()` no longer matches `text_gen`, so
+    /// *any* byte mutation (edit, undo/redo, XOR, block-op, …) refreshes it.
     text_buf: String,
-    /// Whether `text_buf` reflects the current byte buffer.
-    text_valid: bool,
+    /// The `buffer.generation()` that `text_buf` was decoded from. `u64::MAX`
+    /// means "never built" so the first view always rebuilds.
+    text_gen: u64,
     /// Whether `text_buf` has edits not yet committed to the byte buffer.
     text_dirty: bool,
     /// Which nibble the hex-edit caret is on (false = high, true = low).
     hex_low_nibble: bool,
     /// Whether hex-view typing edits the ASCII pane (true) or hex pane (false).
     edit_ascii: bool,
+    /// Frames remaining until the heavy re-analysis fires after a byte edit.
+    /// Reset on each keystroke so rapid typing coalesces into one rescan once
+    /// typing stops (0 = idle). See the debounce tick in `update`.
+    derived_ttl: u32,
 }
 
 impl Document {
@@ -294,6 +309,8 @@ impl Document {
             search_idx: 0,
             scroll_to: Some(0),
             scroll_ttl: 4,
+            text_reveal: None,
+            text_reveal_ttl: 0,
             pe: None,
             bookmarks: Vec::new(),
             entropy_profile: Vec::new(),
@@ -316,10 +333,11 @@ impl Document {
             yara_lib_errors: Vec::new(),
             file_sha256: String::new(),
             text_buf: String::new(),
-            text_valid: false,
+            text_gen: u64::MAX,
             text_dirty: false,
             hex_low_nibble: false,
             edit_ascii: false,
+            derived_ttl: 0,
         }
     }
 
@@ -337,7 +355,23 @@ impl Document {
         self.scroll_ttl = 4;
         self.sel_anchor = Some(off);
         self.sel_cursor = Some((off + len).saturating_sub(1));
+        // Mirror the jump into the Text view (consumed by draw_text): scroll to
+        // and select the same range, so Find / Goto / click-to-jump land there
+        // too, not only in the hex grid.
+        self.text_reveal = Some((off, len.max(1)));
+        self.text_reveal_ttl = 4;
     }
+}
+
+/// Largest char boundary `<= i` (clamped to `s.len()`). Lets the Text view turn a
+/// byte offset (from a Find hit / Goto) into a slice index that never panics on a
+/// multi-byte UTF-8 boundary before counting chars for egui's char-based cursor.
+fn char_boundary_floor(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// Invalidate derived state after a length-changing edit: all offset-based
@@ -351,12 +385,21 @@ fn invalidate_derived(d: &mut Document) {
     d.diff_summary = None;
     d.bt_spans.clear();
     d.bt_result = None;
-    d.text_valid = false;
+    // Note: the text-view cache invalidates itself via buffer.generation(), so
+    // it needs no signal here — every byte mutation is covered, not just these.
 }
 
 struct HexedApp {
     docs: Vec<Document>,
     active: usize,
+    /// The `active` index seen on the previous frame; when it changes we drop the
+    /// hex grid's keyboard focus so a keystroke can't land on a doc the user
+    /// never clicked into (see the focus reset in `update`).
+    last_active: usize,
+    /// Set when a document is removed: closing the active (non-last) tab shifts a
+    /// *different* doc into the same index, so an index compare alone misses it —
+    /// this forces the grid-focus drop regardless of index.
+    grid_focus_stale: bool,
     /// Clipboard-copy feedback: which button flashed and until when (egui time).
     copy_flash_id: &'static str,
     copy_flash_until: f64,
@@ -745,6 +788,8 @@ impl Default for HexedApp {
         Self {
             docs: Vec::new(),
             active: 0,
+            last_active: 0,
+            grid_focus_stale: false,
             copy_flash_id: "",
             copy_flash_until: 0.0,
             strings_min_len: 4,
@@ -895,6 +940,9 @@ impl HexedApp {
             return;
         }
         self.docs.remove(i);
+        // A remove can slide a different document into `active`'s slot without
+        // changing the index, so force a grid-focus drop (see update()).
+        self.grid_focus_stale = true;
         if self.active > i {
             self.active -= 1;
         }
@@ -911,6 +959,37 @@ impl eframe::App for HexedApp {
             ai::Poll::Running => ctx.request_repaint(),
             ai::Poll::JustDone => self.on_ai_done(),
             ai::Poll::Idle => {}
+        }
+
+        // ---- flush + drop editor focus when the active document changed ----
+        // The hex grid and the Text-view field both use constant focus ids, so
+        // focus would otherwise persist across tab switch / open / close onto a
+        // document the user never clicked into. A pointer-driven switch (clicking
+        // a tab) blurs them via egui's press-elsewhere rule, but a keyboard one
+        // (⌘W / ⌘O) has no such press, so a stray keystroke would silently edit
+        // the incoming document. Surrender both here to require a fresh click.
+        // `grid_focus_stale` covers closes that swap a new doc into the same
+        // index (where the index compare alone would miss it).
+        //
+        // Crucially, commit the OUTGOING doc's pending text edit first. Dropping
+        // focus without committing would leave that doc `text_dirty` yet
+        // unfocused — a state where draw_text's `!text_dirty` rebuild gate freezes
+        // text_buf at the stale edit while the byte buffer can still move (undo,
+        // XOR, block-op, …), so the next commit_text would replace_all the stale
+        // text over those bytes and save the wrong file. commit_text only ever
+        // writes docs[i].text_buf into docs[i].buffer and no-ops unless that doc
+        // is dirty, so committing last_active is safe even when a close has since
+        // shifted a different (clean) doc into that slot.
+        if self.active != self.last_active || self.grid_focus_stale {
+            if self.last_active < self.docs.len() {
+                self.commit_text(self.last_active);
+            }
+            ctx.memory_mut(|m| {
+                m.surrender_focus(egui::Id::new(HEX_GRID_ID));
+                m.surrender_focus(egui::Id::new(TEXT_EDIT_ID));
+            });
+            self.last_active = self.active;
+            self.grid_focus_stale = false;
         }
 
         // ---- files opened via Finder "Open With" (macOS 'odoc' events) ----
@@ -974,14 +1053,18 @@ impl eframe::App for HexedApp {
                 if i.key_pressed(egui::Key::W) {
                     action_close = true;
                 }
-                if i.key_pressed(egui::Key::Z) {
+                // Don't fire buffer undo/redo while a text field owns focus —
+                // the field (e.g. the editable Text view, Find, Goto) runs its
+                // OWN undo, and doing both would diverge text_buf from the buffer.
+                // (`typing` excludes the hex grid, so Cmd+Z still works there.)
+                if i.key_pressed(egui::Key::Z) && !typing {
                     if i.modifiers.shift {
                         action_redo = true;
                     } else {
                         action_undo = true;
                     }
                 }
-                if i.key_pressed(egui::Key::Y) {
+                if i.key_pressed(egui::Key::Y) && !typing {
                     action_redo = true;
                 }
             }
@@ -1017,6 +1100,23 @@ impl eframe::App for HexedApp {
                 if len > 0 {
                     d.sel_anchor = Some(0);
                     d.sel_cursor = Some(len - 1);
+                }
+            }
+        }
+
+        // ---- debounce heavy re-analysis while byte-editing ----
+        // Byte edits (draw_hex) set derived_ttl instead of strings_dirty so that
+        // rapid typing doesn't re-hash + re-scan + re-run YARA over the whole
+        // file every keystroke; the rescan fires once, a few frames after the
+        // last keystroke. (The text-view cache updates immediately via
+        // buffer.generation(); only the expensive analyses are deferred.)
+        if let Some(d) = self.docs.get_mut(a) {
+            if d.derived_ttl > 0 {
+                d.derived_ttl -= 1;
+                if d.derived_ttl == 0 {
+                    d.strings_dirty = true;
+                } else {
+                    ctx.request_repaint(); // keep frames coming until it settles
                 }
             }
         }
@@ -1065,9 +1165,18 @@ impl eframe::App for HexedApp {
         // and (if enrichment is on) queue a VirusTotal lookup for its hash.
         if rebuilt_derived {
             self.rescan_yara_active(a);
+            // Only look a file up on VirusTotal when it is unmodified. Editing a
+            // byte changes the hash to one VT can't know, so a lookup would just
+            // burn quota and leak that we're mutating the sample.
             if self.vt.enabled {
-                let sha = self.docs.get(a).map(|d| d.file_sha256.clone()).unwrap_or_default();
-                self.vt.request(&sha);
+                let sha = self
+                    .docs
+                    .get(a)
+                    .filter(|d| !d.buffer.is_dirty())
+                    .map(|d| d.file_sha256.clone());
+                if let Some(sha) = sha {
+                    self.vt.request(&sha);
+                }
             }
         }
         // Drain any finished VT lookup.
@@ -1246,7 +1355,10 @@ impl eframe::App for HexedApp {
                     ui.horizontal(|ui| {
                         for (i, d) in self.docs.iter().enumerate() {
                             let active = i == a;
-                            let dirty = if d.buffer.is_dirty() { " *" } else { "" };
+                            // Uncommitted text-view edits (text_dirty) count too —
+                            // they aren't in the byte buffer yet but are unsaved.
+                            let dirty =
+                                if d.buffer.is_dirty() || d.text_dirty { " *" } else { "" };
                             let name = format!("{}{}", d.file_name, dirty);
                             // Each tab is a distinct rounded chip: filled when
                             // active, faintly outlined otherwise, so they read
@@ -3211,6 +3323,7 @@ impl eframe::App for HexedApp {
 
         // ---- insert / delete bytes (resize + undoable) ----
         if let Some((off, n)) = action_insert {
+            self.commit_text(a); // flush any pending text-view edits first
             let mut st = None;
             if let Some(d) = self.docs.get_mut(a) {
                 let off = off.min(d.buffer.len());
@@ -3229,6 +3342,7 @@ impl eframe::App for HexedApp {
             }
         }
         if let Some((off, len)) = action_delete {
+            self.commit_text(a); // flush any pending text-view edits first
             let mut st = None;
             if let Some(d) = self.docs.get_mut(a) {
                 let len = len.min(d.buffer.len().saturating_sub(off));
@@ -3278,6 +3392,7 @@ impl eframe::App for HexedApp {
 
         // ---- find & replace (overwrite-only ⇒ equal length required) ----
         if action_replace_next || action_replace_all {
+            self.commit_text(a); // flush any pending text-view edits first
             let rep = if search_hex {
                 parse_hex_bytes(&replace_query)
                     .ok_or_else(|| "Replacement must be concrete hex bytes (e.g. 90 90).".to_string())
@@ -4289,11 +4404,13 @@ impl HexedApp {
             );
             return (None, None);
         }
-        // Rebuild the text buffer from bytes unless we hold uncommitted edits.
+        // Rebuild the text buffer from bytes when the buffer changed under us
+        // (any edit/undo/redo/op bumps generation), unless we hold uncommitted
+        // text edits of our own.
         if let Some(d) = self.docs.get_mut(active) {
-            if !d.text_valid && !d.text_dirty {
+            if !d.text_dirty && d.buffer.generation() != d.text_gen {
                 d.text_buf = String::from_utf8_lossy(d.buffer.data()).into_owned();
-                d.text_valid = true;
+                d.text_gen = d.buffer.generation();
             }
         }
         if !editable {
@@ -4311,15 +4428,52 @@ impl HexedApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if let Some(d) = self.docs.get_mut(active) {
-                    let r = ui.add(
-                        egui::TextEdit::multiline(&mut d.text_buf)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(30)
-                            .interactive(editable),
-                    );
-                    changed = r.changed();
-                    lost_focus = r.lost_focus();
+                    let out = egui::TextEdit::multiline(&mut d.text_buf)
+                        .id(egui::Id::new(TEXT_EDIT_ID))
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(30)
+                        .interactive(editable)
+                        .show(ui);
+                    changed = out.response.changed();
+                    lost_focus = out.response.lost_focus();
+
+                    // Reveal a pending Find / Goto / click-to-jump target: scroll to
+                    // it and (when editable, so egui paints the highlight) select it.
+                    // The byte offset maps 1:1 to a text_buf byte offset because the
+                    // editable text view requires valid UTF-8; clamp to a char
+                    // boundary so slicing can't panic, then count chars for the
+                    // char-based cursor. egui does NOT auto-scroll a programmatic
+                    // cursor, and focusing the field makes egui scroll the widget to
+                    // the top — so we re-assert our own scroll for `text_reveal_ttl`
+                    // frames to win that race and land on the match.
+                    if let Some((off, len)) = d.text_reveal {
+                        if d.text_reveal_ttl > 0 {
+                            let s = char_boundary_floor(&d.text_buf, off);
+                            let e = char_boundary_floor(&d.text_buf, off.saturating_add(len));
+                            let cstart = d.text_buf[..s].chars().count();
+                            let cend = d.text_buf[..e].chars().count();
+                            if editable {
+                                let mut st = out.state;
+                                st.set_ccursor_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(cstart),
+                                    egui::text::CCursor::new(cend),
+                                )));
+                                st.store(ui.ctx(), egui::Id::new(TEXT_EDIT_ID));
+                                ui.memory_mut(|m| m.request_focus(egui::Id::new(TEXT_EDIT_ID)));
+                            }
+                            let caret = out
+                                .galley
+                                .pos_from_ccursor(egui::text::CCursor::new(cstart))
+                                .translate(out.galley_pos.to_vec2());
+                            ui.scroll_to_rect(caret.expand(24.0), Some(egui::Align::Center));
+                            d.text_reveal_ttl -= 1;
+                            if d.text_reveal_ttl == 0 {
+                                d.text_reveal = None;
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                    }
                 }
             });
 
@@ -4344,7 +4498,9 @@ impl HexedApp {
                 d.buffer.replace_all(bytes);
                 d.text_dirty = false;
                 invalidate_derived(d);
-                d.text_valid = true; // text_buf already matches the buffer
+                // text_buf already equals the just-written buffer, so record its
+                // generation to avoid a redundant rebuild next frame.
+                d.text_gen = d.buffer.generation();
             }
         }
     }
@@ -4556,7 +4712,10 @@ impl HexedApp {
                 }
 
                 // ---- keyboard byte-editing (010-style) when the grid is focused ----
-                if response.has_focus() {
+                // Require a placed caret (a click sets sel_cursor): a fresh doc has
+                // sel_cursor=None, so a stray keystroke can't overwrite its byte 0
+                // just because the grid inherited focus from a previous document.
+                if response.has_focus() && caret0.is_some() {
                     let mut cur = caret0.unwrap_or(0);
                     let mut low = low0;
                     let mut moved = false;
@@ -4702,11 +4861,10 @@ impl HexedApp {
                 for (off, b) in &edits {
                     d.buffer.overwrite(*off, &[*b]);
                 }
-                // Length is unchanged, so offset-based state stays valid; just
-                // mark the byte-derived views stale (a full re-scan every
-                // keystroke would be too costly — it refreshes on save/reopen).
-                d.strings_dirty = true;
-                d.text_valid = false;
+                // Defer the expensive re-analysis: reset the debounce so it fires
+                // once, shortly after typing stops, instead of every keystroke.
+                // (The text view refreshes immediately via buffer.generation().)
+                d.derived_ttl = EDIT_RESCAN_DELAY;
             }
             if let Some(c) = new_caret {
                 d.sel_anchor = Some(c);
@@ -4731,6 +4889,18 @@ impl HexedApp {
 /// Stable egui id for the hex grid's interaction/focus target, so the keyboard
 /// handler can tell "editing bytes in the grid" from "typing in a text field".
 const HEX_GRID_ID: &str = "hexed_hex_grid";
+
+/// Stable egui id for the editable Text-view field. A `TextEdit`'s auto id is
+/// structural (identical across documents, since `draw_text` is one code path),
+/// so its keyboard focus would otherwise persist onto a document the user never
+/// clicked into after a keyboard-driven active-doc change (⌘W / ⌘O). Pinning the
+/// id lets `update()` surrender that focus on every switch, just like the grid.
+const TEXT_EDIT_ID: &str = "hexed_text_edit";
+
+/// Frames of no-typing after a byte edit before the heavy re-analysis (strings,
+/// PE, IOC, YARA, hashes, …) runs. ~0.25 s at 60 fps — long enough to coalesce a
+/// burst of keystrokes into a single rescan, short enough to feel responsive.
+const EDIT_RESCAN_DELAY: u32 = 15;
 
 /// The latest value of the byte at `off` given edits queued this frame (so the
 /// second hex nibble sees the first). Falls back to the buffer's current byte.

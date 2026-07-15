@@ -29,17 +29,40 @@ pub struct Buffer {
     undo: Vec<Edit>,
     redo: Vec<Edit>,
     dirty: bool,
+    /// Bumped on every content mutation. Lets callers cheaply detect that any
+    /// change happened (e.g. to invalidate a decoded-text cache) without having
+    /// to remember to signal it at each individual mutation site.
+    gen: u64,
 }
 
 impl Buffer {
     pub fn from_bytes(data: Vec<u8>) -> Self {
-        Buffer { data, path: None, undo: Vec::new(), redo: Vec::new(), dirty: false }
+        Buffer { data, path: None, undo: Vec::new(), redo: Vec::new(), dirty: false, gen: 0 }
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let p = path.as_ref();
         let data = std::fs::read(p)?;
-        Ok(Buffer { data, path: Some(p.to_path_buf()), undo: Vec::new(), redo: Vec::new(), dirty: false })
+        Ok(Buffer {
+            data,
+            path: Some(p.to_path_buf()),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            dirty: false,
+            gen: 0,
+        })
+    }
+
+    /// A counter incremented on every content mutation. Two reads returning the
+    /// same value guarantee the bytes are unchanged between them.
+    pub fn generation(&self) -> u64 {
+        self.gen
+    }
+
+    /// Mark the buffer modified: set the dirty flag and bump the generation.
+    fn mark_modified(&mut self) {
+        self.dirty = true;
+        self.gen = self.gen.wrapping_add(1);
     }
 
     pub fn len(&self) -> usize {
@@ -85,7 +108,7 @@ impl Buffer {
         self.data[offset..end].copy_from_slice(&new[..n]);
         self.undo.push(Edit::Overwrite { offset, bytes: old });
         self.redo.clear();
-        self.dirty = true;
+        self.mark_modified();
     }
 
     /// Insert `bytes` at `offset` (0..=len), growing the buffer. Undoable.
@@ -96,7 +119,7 @@ impl Buffer {
         self.data.splice(offset..offset, bytes.iter().copied());
         self.undo.push(Edit::Delete { offset, len: bytes.len() });
         self.redo.clear();
-        self.dirty = true;
+        self.mark_modified();
     }
 
     /// Delete `len` bytes at `offset` (clamped), shrinking the buffer. Undoable.
@@ -108,7 +131,7 @@ impl Buffer {
         let removed: Vec<u8> = self.data.splice(offset..end, std::iter::empty()).collect();
         self.undo.push(Edit::Insert { offset, bytes: removed });
         self.redo.clear();
-        self.dirty = true;
+        self.mark_modified();
     }
 
     /// Apply a history edit to the data, returning the inverse edit.
@@ -147,14 +170,14 @@ impl Buffer {
         let old = std::mem::replace(&mut self.data, new);
         self.undo.push(Edit::Replace { bytes: old });
         self.redo.clear();
-        self.dirty = true;
+        self.mark_modified();
     }
 
     pub fn undo(&mut self) -> bool {
         if let Some(edit) = self.undo.pop() {
             let inverse = self.apply(edit);
             self.redo.push(inverse);
-            self.dirty = true;
+            self.mark_modified();
             true
         } else {
             false
@@ -165,7 +188,7 @@ impl Buffer {
         if let Some(edit) = self.redo.pop() {
             let inverse = self.apply(edit);
             self.undo.push(inverse);
-            self.dirty = true;
+            self.mark_modified();
             true
         } else {
             false
@@ -226,6 +249,34 @@ mod tests {
         let mut b2 = Buffer::from_bytes(b"same".to_vec());
         b2.replace_all(b"same".to_vec());
         assert!(!b2.undo());
+    }
+
+    #[test]
+    fn generation_bumps_on_every_mutation() {
+        let mut b = Buffer::from_bytes(vec![0, 1, 2, 3]);
+        let g0 = b.generation();
+        b.overwrite(0, &[9]);
+        let g1 = b.generation();
+        assert_ne!(g0, g1, "overwrite must bump generation");
+        b.insert(0, &[7]);
+        let g2 = b.generation();
+        assert_ne!(g1, g2, "insert must bump generation");
+        b.delete(0, 1);
+        let g3 = b.generation();
+        assert_ne!(g2, g3, "delete must bump generation");
+        b.undo();
+        let g4 = b.generation();
+        assert_ne!(g3, g4, "undo must bump generation");
+        b.redo();
+        assert_ne!(g4, b.generation(), "redo must bump generation");
+        b.replace_all(b"xyz".to_vec());
+        let g5 = b.generation();
+        assert_ne!(g4, g5);
+        // A no-op overwrite / unchanged replace_all must NOT bump.
+        let g6 = b.generation();
+        b.overwrite(99, &[1]); // out of range -> no-op
+        b.replace_all(b"xyz".to_vec()); // identical -> no-op
+        assert_eq!(g6, b.generation(), "no-op mutations must not bump generation");
     }
 
     #[test]
