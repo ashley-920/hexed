@@ -83,7 +83,9 @@ pub fn extract_iocs(data: &[u8]) -> Vec<Ioc> {
 /// Wrap an indicator in defanged form (`hxxp`, `1.2.3[.]4`, `evil[.]com`) so it
 /// is safe to paste into a report or chat without becoming a live link.
 pub fn defang(s: &str) -> String {
-    let out = s.replace("http://", "hxxp://").replace("https://", "hxxps://");
+    let out = s
+        .replace("http://", "hxxp://")
+        .replace("https://", "hxxps://");
     // Neutralize every dot so IPs/domains/URLs can't resolve or auto-link.
     out.replace('.', "[.]")
 }
@@ -136,7 +138,9 @@ fn scan_urls(t: &[u8], push: &mut impl FnMut(IocKind, String, usize)) {
                 end += 1;
             }
             // trim trailing punctuation that's usually sentence noise
-            while end > start && matches!(t[end - 1], b'.' | b',' | b')' | b']' | b'"' | b'\'' | b';') {
+            while end > start
+                && matches!(t[end - 1], b'.' | b',' | b')' | b']' | b'"' | b'\'' | b';')
+            {
                 end -= 1;
             }
             if end > start + scheme.len() {
@@ -211,8 +215,7 @@ fn scan_ipv4(t: &[u8], push: &mut impl FnMut(IocKind, String, usize)) {
         // followed by a digit. A trailing '.' that's sentence punctuation
         // ("the C2 is 1.2.3.4.") must NOT discard an otherwise-valid IP.
         let followed = j < n
-            && (t[j].is_ascii_digit()
-                || (t[j] == b'.' && j + 1 < n && t[j + 1].is_ascii_digit()));
+            && (t[j].is_ascii_digit() || (t[j] == b'.' && j + 1 < n && t[j + 1].is_ascii_digit()));
         let trailing_zero = octets[1] == 0 && octets[2] == 0 && octets[3] == 0;
         if ok && count == 4 && !preceded && !followed && !trailing_zero {
             push(IocKind::Ipv4, ascii(&t[start..j]), start);
@@ -262,7 +265,8 @@ fn scan_win_paths(t: &[u8], push: &mut impl FnMut(IocKind, String, usize)) {
             && t[i + 3] != b'/'
             && (i == 0 || !t[i - 1].is_ascii_alphanumeric());
         // UNC: exactly two backslashes then a host character (not more slashes).
-        let unc = i + 2 < n && t[i] == b'\\' && t[i + 1] == b'\\' && t[i + 2].is_ascii_alphanumeric();
+        let unc =
+            i + 2 < n && t[i] == b'\\' && t[i + 1] == b'\\' && t[i + 2].is_ascii_alphanumeric();
         // Env: %NAME%\ with a real variable name.
         let env = env_path(&t[i..]);
         if drive || unc || env {
@@ -297,9 +301,28 @@ fn env_path(t: &[u8]) -> bool {
 }
 
 const UNIX_ROOTS: &[&[u8]] = &[
-    b"usr/", b"etc/", b"tmp/", b"var/", b"bin/", b"opt/", b"lib/", b"home/", b"root/",
-    b"sbin/", b"mnt/", b"srv/", b"dev/", b"proc/", b"sys/", b"boot/", b"Users/", b"Library/",
-    b"Applications/", b"System/", b"private/", b"Volumes/",
+    b"usr/",
+    b"etc/",
+    b"tmp/",
+    b"var/",
+    b"bin/",
+    b"opt/",
+    b"lib/",
+    b"home/",
+    b"root/",
+    b"sbin/",
+    b"mnt/",
+    b"srv/",
+    b"dev/",
+    b"proc/",
+    b"sys/",
+    b"boot/",
+    b"Users/",
+    b"Library/",
+    b"Applications/",
+    b"System/",
+    b"private/",
+    b"Volumes/",
 ];
 
 fn scan_unix_paths(t: &[u8], push: &mut impl FnMut(IocKind, String, usize)) {
@@ -335,8 +358,15 @@ fn scan_unix_paths(t: &[u8], push: &mut impl FnMut(IocKind, String, usize)) {
 }
 
 const REG_PREFIXES: &[&[u8]] = &[
-    b"HKEY_LOCAL_MACHINE", b"HKEY_CURRENT_USER", b"HKEY_CLASSES_ROOT", b"HKEY_USERS",
-    b"HKEY_CURRENT_CONFIG", b"HKLM\\", b"HKCU\\", b"HKCR\\", b"HKU\\",
+    b"HKEY_LOCAL_MACHINE",
+    b"HKEY_CURRENT_USER",
+    b"HKEY_CLASSES_ROOT",
+    b"HKEY_USERS",
+    b"HKEY_CURRENT_CONFIG",
+    b"HKLM\\",
+    b"HKCU\\",
+    b"HKCR\\",
+    b"HKU\\",
 ];
 
 fn scan_registry(t: &[u8], push: &mut impl FnMut(IocKind, String, usize)) {
@@ -443,13 +473,80 @@ fn looks_like_ipv4(host: &[u8]) -> bool {
 
 /// A small curated TLD set — real TLDs plus ones common in malware infra.
 const TLDS: &[&[u8]] = &[
-    b"com", b"net", b"org", b"info", b"biz", b"xyz", b"top", b"club", b"online", b"site",
-    b"shop", b"store", b"live", b"icu", b"vip", b"cc", b"io", b"co", b"me", b"tv", b"ws",
-    b"su", b"ru", b"cn", b"br", b"in", b"uk", b"de", b"fr", b"nl", b"eu", b"pl", b"it",
-    b"es", b"ua", b"kr", b"jp", b"tw", b"hk", b"tk", b"ml", b"ga", b"cf", b"gq", b"pw",
-    b"pro", b"dev", b"app", b"cloud", b"work", b"space", b"fun", b"link", b"gov", b"edu",
-    b"mil", b"int", b"asia", b"mobi", b"name", b"tech", b"host", b"press", b"gdn", b"bid",
-    b"loan", b"win", b"download", b"stream", b"party", b"review", b"trade", b"date", b"kim",
+    b"com",
+    b"net",
+    b"org",
+    b"info",
+    b"biz",
+    b"xyz",
+    b"top",
+    b"club",
+    b"online",
+    b"site",
+    b"shop",
+    b"store",
+    b"live",
+    b"icu",
+    b"vip",
+    b"cc",
+    b"io",
+    b"co",
+    b"me",
+    b"tv",
+    b"ws",
+    b"su",
+    b"ru",
+    b"cn",
+    b"br",
+    b"in",
+    b"uk",
+    b"de",
+    b"fr",
+    b"nl",
+    b"eu",
+    b"pl",
+    b"it",
+    b"es",
+    b"ua",
+    b"kr",
+    b"jp",
+    b"tw",
+    b"hk",
+    b"tk",
+    b"ml",
+    b"ga",
+    b"cf",
+    b"gq",
+    b"pw",
+    b"pro",
+    b"dev",
+    b"app",
+    b"cloud",
+    b"work",
+    b"space",
+    b"fun",
+    b"link",
+    b"gov",
+    b"edu",
+    b"mil",
+    b"int",
+    b"asia",
+    b"mobi",
+    b"name",
+    b"tech",
+    b"host",
+    b"press",
+    b"gdn",
+    b"bid",
+    b"loan",
+    b"win",
+    b"download",
+    b"stream",
+    b"party",
+    b"review",
+    b"trade",
+    b"date",
+    b"kim",
 ];
 
 fn valid_domain(host: &[u8]) -> bool {
@@ -468,7 +565,7 @@ fn valid_domain(host: &[u8]) -> bool {
     }
     let tld = labels[labels.len() - 1].to_ascii_lowercase();
     // TLD must be alphabetic and in the curated set
-    tld.iter().all(|b| b.is_ascii_alphabetic()) && TLDS.iter().any(|t| *t == tld.as_slice())
+    tld.iter().all(|b| b.is_ascii_alphabetic()) && TLDS.contains(&tld.as_slice())
 }
 
 #[cfg(test)]
@@ -506,7 +603,10 @@ mod tests {
         // version/netmask artifacts x.0.0.0 are dropped; localhost is kept.
         assert!(kinds(b"\x00ver 1.0.0.0 x\x00", IocKind::Ipv4).is_empty());
         assert!(kinds(b"\x00net 6.0.0.0 x\x00", IocKind::Ipv4).is_empty());
-        assert_eq!(kinds(b"\x00lo 127.0.0.1 x\x00", IocKind::Ipv4), vec!["127.0.0.1"]);
+        assert_eq!(
+            kinds(b"\x00lo 127.0.0.1 x\x00", IocKind::Ipv4),
+            vec!["127.0.0.1"]
+        );
     }
 
     #[test]
@@ -518,7 +618,10 @@ mod tests {
     #[test]
     fn url_with_http_in_path_not_truncated() {
         // "http" inside a path must not trigger the adjacent-URL split.
-        let urls = kinds(b"\x00get http://cdn.example.com/httpstuff ok\x00", IocKind::Url);
+        let urls = kinds(
+            b"\x00get http://cdn.example.com/httpstuff ok\x00",
+            IocKind::Url,
+        );
         assert_eq!(urls, vec!["http://cdn.example.com/httpstuff"]);
     }
 
@@ -545,7 +648,10 @@ mod tests {
 
     #[test]
     fn finds_win_and_registry() {
-        let p = kinds(b"\x00C:\\Users\\v\\AppData\\Local\\Temp\\a.exe\x00", IocKind::WinPath);
+        let p = kinds(
+            b"\x00C:\\Users\\v\\AppData\\Local\\Temp\\a.exe\x00",
+            IocKind::WinPath,
+        );
         assert_eq!(p.len(), 1);
         let r = kinds(
             b"\x00HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\x00",
@@ -556,7 +662,10 @@ mod tests {
 
     #[test]
     fn finds_unix_path() {
-        let p = kinds(b"\x00drop /tmp/.hidden/payload.sh here\x00", IocKind::UnixPath);
+        let p = kinds(
+            b"\x00drop /tmp/.hidden/payload.sh here\x00",
+            IocKind::UnixPath,
+        );
         assert_eq!(p, vec!["/tmp/.hidden/payload.sh"]);
     }
 

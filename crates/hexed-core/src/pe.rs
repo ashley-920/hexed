@@ -23,7 +23,13 @@ fn read_cstr(data: &[u8], off: usize) -> String {
             rest.iter()
                 .take_while(|&&b| b != 0)
                 .take(256)
-                .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '.' })
+                .map(|&b| {
+                    if (0x20..=0x7e).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -161,7 +167,10 @@ impl PeInfo {
         }
         match self.linker_major {
             0 => "unknown".to_string(),
-            2 => format!("GNU ld / MinGW (v{}.{:02})", self.linker_major, self.linker_minor),
+            2 => format!(
+                "GNU ld / MinGW (v{}.{:02})",
+                self.linker_major, self.linker_minor
+            ),
             v => format!("MSVC link v{}.{:02}", v, self.linker_minor),
         }
     }
@@ -355,13 +364,20 @@ pub fn parse_pe(data: &[u8]) -> Option<PeInfo> {
         let name: String = name_bytes
             .iter()
             .take_while(|&&b| b != 0)
-            .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..=0x7e).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         let raw_size = u32le(data, s + 16)?;
         let raw_ptr = u32le(data, s + 20)?;
         let start = raw_ptr as usize;
         let end = start.saturating_add(raw_size as usize).min(data.len());
-        let entropy = crate::entropy::shannon_entropy(if start < end { &data[start..end] } else { &[] });
+        let entropy =
+            crate::entropy::shannon_entropy(if start < end { &data[start..end] } else { &[] });
         sections.push(PeSection {
             name,
             virtual_size: u32le(data, s + 8)?,
@@ -506,7 +522,7 @@ pub fn imphash(pe: &PeInfo) -> String {
         // module name; other extensions (.drv, .cpl) are kept, as pefile does.
         let dll = imp.dll.to_ascii_lowercase();
         let dll_stem = match dll.rsplit_once('.') {
-            Some((stem, ext)) if matches!(ext, "dll" | "ocx" | "sys") => stem,
+            Some((stem, "dll" | "ocx" | "sys")) => stem,
             _ => dll.as_str(),
         };
         for f in &imp.funcs {
@@ -543,30 +559,86 @@ pub struct ApiFlag {
 const SUSPICIOUS_APIS: &[(&str, &str, &str)] = &[
     // process injection / execution
     ("virtualalloc", "Injection", "allocate executable memory"),
-    ("virtualallocex", "Injection", "allocate memory in another process"),
-    ("virtualprotect", "Injection", "change memory protection (e.g. make RWX)"),
-    ("virtualprotectex", "Injection", "change memory protection in another process"),
-    ("writeprocessmemory", "Injection", "write into another process"),
-    ("readprocessmemory", "Injection", "read another process's memory"),
-    ("createremotethread", "Injection", "run code in another process"),
-    ("createremotethreadex", "Injection", "run code in another process"),
-    ("ntcreatethreadex", "Injection", "stealthy remote thread creation"),
+    (
+        "virtualallocex",
+        "Injection",
+        "allocate memory in another process",
+    ),
+    (
+        "virtualprotect",
+        "Injection",
+        "change memory protection (e.g. make RWX)",
+    ),
+    (
+        "virtualprotectex",
+        "Injection",
+        "change memory protection in another process",
+    ),
+    (
+        "writeprocessmemory",
+        "Injection",
+        "write into another process",
+    ),
+    (
+        "readprocessmemory",
+        "Injection",
+        "read another process's memory",
+    ),
+    (
+        "createremotethread",
+        "Injection",
+        "run code in another process",
+    ),
+    (
+        "createremotethreadex",
+        "Injection",
+        "run code in another process",
+    ),
+    (
+        "ntcreatethreadex",
+        "Injection",
+        "stealthy remote thread creation",
+    ),
     ("queueuserapc", "Injection", "APC injection"),
     ("ntunmapviewofsection", "Injection", "process hollowing"),
-    ("ntmapviewofsection", "Injection", "section-mapping injection"),
-    ("setthreadcontext", "Injection", "hijack a thread's execution"),
-    ("openprocess", "Injection", "obtain a handle to another process"),
+    (
+        "ntmapviewofsection",
+        "Injection",
+        "section-mapping injection",
+    ),
+    (
+        "setthreadcontext",
+        "Injection",
+        "hijack a thread's execution",
+    ),
+    (
+        "openprocess",
+        "Injection",
+        "obtain a handle to another process",
+    ),
     ("createprocess", "Execution", "spawn a process"),
-    ("createprocessinternal", "Execution", "spawn a process (internal)"),
+    (
+        "createprocessinternal",
+        "Execution",
+        "spawn a process (internal)",
+    ),
     ("shellexecute", "Execution", "launch a file/URL"),
     ("winexec", "Execution", "legacy process launch"),
     ("system", "Execution", "run a shell command"),
     // dynamic resolution
     ("loadlibrary", "Dynamic API", "load a DLL at runtime"),
     ("loadlibraryex", "Dynamic API", "load a DLL at runtime"),
-    ("getprocaddress", "Dynamic API", "resolve an API by name (evasion)"),
+    (
+        "getprocaddress",
+        "Dynamic API",
+        "resolve an API by name (evasion)",
+    ),
     ("ldrloaddll", "Dynamic API", "low-level DLL load"),
-    ("ldrgetprocedureaddress", "Dynamic API", "low-level API resolve"),
+    (
+        "ldrgetprocedureaddress",
+        "Dynamic API",
+        "low-level API resolve",
+    ),
     // persistence
     ("regsetvalue", "Persistence", "write a registry value"),
     ("regsetvalueex", "Persistence", "write a registry value"),
@@ -583,18 +655,46 @@ const SUSPICIOUS_APIS: &[(&str, &str, &str)] = &[
     ("bitblt", "Spying", "screen capture"),
     ("getclipboarddata", "Spying", "read the clipboard"),
     // privilege / token
-    ("adjusttokenprivileges", "Privilege", "enable privileges (e.g. SeDebug)"),
-    ("lookupprivilegevalue", "Privilege", "look up a privilege LUID"),
+    (
+        "adjusttokenprivileges",
+        "Privilege",
+        "enable privileges (e.g. SeDebug)",
+    ),
+    (
+        "lookupprivilegevalue",
+        "Privilege",
+        "look up a privilege LUID",
+    ),
     ("openprocesstoken", "Privilege", "open a process token"),
     // anti-analysis
     ("isdebuggerpresent", "Anti-analysis", "debugger check"),
-    ("checkremotedebuggerpresent", "Anti-analysis", "debugger check"),
-    ("ntqueryinformationprocess", "Anti-analysis", "debugger/enum check"),
-    ("outputdebugstring", "Anti-analysis", "debugger trick/timing"),
+    (
+        "checkremotedebuggerpresent",
+        "Anti-analysis",
+        "debugger check",
+    ),
+    (
+        "ntqueryinformationprocess",
+        "Anti-analysis",
+        "debugger/enum check",
+    ),
+    (
+        "outputdebugstring",
+        "Anti-analysis",
+        "debugger trick/timing",
+    ),
     ("gettickcount", "Anti-analysis", "timing/sandbox check"),
-    ("queryperformancecounter", "Anti-analysis", "timing/sandbox check"),
+    (
+        "queryperformancecounter",
+        "Anti-analysis",
+        "timing/sandbox check",
+    ),
     ("sleep", "Anti-analysis", "stall to evade sandboxes"),
-    ("createtoolhelp32snapshot", "Discovery", "enumerate processes"),
+    (
+        "createtoolhelp32snapshot",
+        "Discovery",
+        "enumerate processes",
+    ),
     ("process32first", "Discovery", "enumerate processes"),
     ("process32next", "Discovery", "enumerate processes"),
     // networking / download
@@ -728,8 +828,14 @@ mod tests {
         // pefile's imphash of {KERNEL32.dll: [CreateFileA], USER32.dll: [MessageBoxA]}
         // is md5("kernel32.createfilea,user32.messageboxa").
         let pe = pe_with_imports(vec![
-            PeImport { dll: "KERNEL32.dll".into(), funcs: vec!["CreateFileA".into()] },
-            PeImport { dll: "USER32.dll".into(), funcs: vec!["MessageBoxA".into()] },
+            PeImport {
+                dll: "KERNEL32.dll".into(),
+                funcs: vec!["CreateFileA".into()],
+            },
+            PeImport {
+                dll: "USER32.dll".into(),
+                funcs: vec!["MessageBoxA".into()],
+            },
         ]);
         let expected = crate::hashes::md5_hex(b"kernel32.createfilea,user32.messageboxa");
         assert_eq!(imphash(&pe), expected);
@@ -752,7 +858,10 @@ mod tests {
             dll: "WINSPOOL.DRV".into(),
             funcs: vec!["OpenPrinterW".into(), String::new()],
         }]);
-        assert_eq!(imphash(&pe), crate::hashes::md5_hex(b"winspool.drv.openprinterw"));
+        assert_eq!(
+            imphash(&pe),
+            crate::hashes::md5_hex(b"winspool.drv.openprinterw")
+        );
     }
 
     #[test]

@@ -12,7 +12,10 @@ pub struct Histogram {
 
 impl Default for Histogram {
     fn default() -> Self {
-        Histogram { counts: [0; 256], total: 0 }
+        Histogram {
+            counts: [0; 256],
+            total: 0,
+        }
     }
 }
 
@@ -58,7 +61,10 @@ pub fn byte_histogram(data: &[u8]) -> Histogram {
     for &b in data {
         counts[b as usize] += 1;
     }
-    Histogram { counts, total: data.len() as u64 }
+    Histogram {
+        counts,
+        total: data.len() as u64,
+    }
 }
 
 #[cfg(test)]

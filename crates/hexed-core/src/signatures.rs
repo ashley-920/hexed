@@ -73,7 +73,9 @@ const SIGS: &[Sig] = &[
     },
     Sig {
         name: "CRC32 table",
-        needle: &[0x00, 0x00, 0x00, 0x00, 0x96, 0x30, 0x07, 0x77, 0x2c, 0x61, 0x0e, 0xee],
+        needle: &[
+            0x00, 0x00, 0x00, 0x00, 0x96, 0x30, 0x07, 0x77, 0x2c, 0x61, 0x0e, 0xee,
+        ],
         note: "Standard reflected CRC-32 lookup table (poly 0xEDB88320)",
     },
     Sig {
@@ -108,10 +110,17 @@ pub fn scan_signatures(data: &[u8]) -> Vec<SigHit> {
         let mut count = 0;
         let mut start = 0;
         while start + sig.needle.len() <= data.len() {
-            match data[start..].windows(sig.needle.len()).position(|w| w == sig.needle) {
+            match data[start..]
+                .windows(sig.needle.len())
+                .position(|w| w == sig.needle)
+            {
                 Some(p) => {
                     let off = start + p;
-                    out.push(SigHit { name: sig.name, offset: off, note: sig.note });
+                    out.push(SigHit {
+                        name: sig.name,
+                        offset: off,
+                        note: sig.note,
+                    });
                     count += 1;
                     if count >= PER_SIG_MAX {
                         break;

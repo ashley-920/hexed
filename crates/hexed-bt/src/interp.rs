@@ -114,7 +114,11 @@ pub fn interpret(program: &Program, data: &[u8]) -> Result<Template, RunError> {
     it.scopes.push(Scope::default());
     let mut root = Vec::new();
     it.exec_block_into(program, &mut root)?;
-    Ok(Template { root, log: it.log, end_pos: it.pos })
+    Ok(Template {
+        root,
+        log: it.log,
+        end_pos: it.pos,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +193,10 @@ impl<'a> Interp<'a> {
     }
 
     fn err<T>(&self, msg: impl Into<String>) -> Result<T, RunError> {
-        Err(RunError { msg: msg.into(), pos: self.pos })
+        Err(RunError {
+            msg: msg.into(),
+            pos: self.pos,
+        })
     }
 
     // ---- scope helpers ----
@@ -202,7 +209,11 @@ impl<'a> Interp<'a> {
         None
     }
     fn bind(&mut self, name: &str, v: Value) {
-        self.scopes.last_mut().unwrap().vars.insert(name.to_string(), v);
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .vars
+            .insert(name.to_string(), v);
     }
     fn assign(&mut self, name: &str, v: Value) {
         for s in self.scopes.iter_mut().rev() {
@@ -212,7 +223,11 @@ impl<'a> Interp<'a> {
             }
         }
         // Implicit global if never declared.
-        self.scopes.first_mut().unwrap().vars.insert(name.to_string(), v);
+        self.scopes
+            .first_mut()
+            .unwrap()
+            .vars
+            .insert(name.to_string(), v);
     }
 
     // ---- statement execution ----
@@ -274,7 +289,12 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::For { init, cond, step, body } => {
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
                 self.scopes.push(Scope::default());
                 let res = (|| {
                     if let Some(i) = init {
@@ -456,7 +476,8 @@ impl<'a> Interp<'a> {
         // children, keep primitive elements collapsed.
         let mut children = Vec::new();
         let mut vals = Vec::new();
-        let expand = !matches!(ty, TypeRef::Named(n) if builtin_type(&self.resolve_alias(n)).is_some());
+        let expand =
+            !matches!(ty, TypeRef::Named(n) if builtin_type(&self.resolve_alias(n)).is_some());
         for i in 0..count {
             self.guard_progress()?; // charge each element against the loop budget
             let elem_start = self.pos;
@@ -502,7 +523,9 @@ impl<'a> Interp<'a> {
         self.depth += 1;
         if self.depth > MAX_TYPE_DEPTH {
             self.depth -= 1;
-            return self.err(format!("type `{name}` nested too deeply (recursive struct?)"));
+            return self.err(format!(
+                "type `{name}` nested too deeply (recursive struct?)"
+            ));
         }
         let r = self.read_type_inner(ty, name, attrs);
         self.depth -= 1;
@@ -725,10 +748,10 @@ impl<'a> Interp<'a> {
                 let b = self.eval(base)?;
                 let i = self.eval(index)?.as_i64();
                 match b {
-                    Value::Array(items) => items
-                        .get(i as usize)
-                        .cloned()
-                        .ok_or_else(|| RunError { msg: "index out of range".into(), pos: self.pos }),
+                    Value::Array(items) => items.get(i as usize).cloned().ok_or_else(|| RunError {
+                        msg: "index out of range".into(),
+                        pos: self.pos,
+                    }),
                     Value::Str(s) => Ok(Value::Int(
                         s.as_bytes().get(i as usize).map(|b| *b as i64).unwrap_or(0),
                     )),
@@ -737,9 +760,10 @@ impl<'a> Interp<'a> {
             }
             Expr::Member { base, name, .. } => {
                 let b = self.eval(base)?;
-                b.field(name)
-                    .cloned()
-                    .ok_or_else(|| RunError { msg: format!("no field `{name}`"), pos: self.pos })
+                b.field(name).cloned().ok_or_else(|| RunError {
+                    msg: format!("no field `{name}`"),
+                    pos: self.pos,
+                })
             }
             Expr::Sizeof(inner) => {
                 if let Expr::Ident(tn) = inner.as_ref() {
@@ -776,7 +800,11 @@ impl<'a> Interp<'a> {
             // Only meaningful on an lvalue identifier.
             if let Expr::Ident(name) = expr {
                 let old = self.lookup(name).cloned().unwrap_or(Value::Int(0)).as_i64();
-                let new = if op == "++" { old.wrapping_add(1) } else { old.wrapping_sub(1) };
+                let new = if op == "++" {
+                    old.wrapping_add(1)
+                } else {
+                    old.wrapping_sub(1)
+                };
                 self.assign(name, Value::Int(new));
                 return Ok(Value::Int(if prefix { new } else { old }));
             }
@@ -828,7 +856,13 @@ impl<'a> Interp<'a> {
                 "+" => a + b,
                 "-" => a - b,
                 "*" => a * b,
-                "/" => if b != 0.0 { a / b } else { 0.0 },
+                "/" => {
+                    if b != 0.0 {
+                        a / b
+                    } else {
+                        0.0
+                    }
+                }
                 _ => unreachable!(),
             }));
         }
@@ -838,8 +872,20 @@ impl<'a> Interp<'a> {
             "+" => a.wrapping_add(b),
             "-" => a.wrapping_sub(b),
             "*" => a.wrapping_mul(b),
-            "/" => if b != 0 { a.wrapping_div(b) } else { 0 },
-            "%" => if b != 0 { a.wrapping_rem(b) } else { 0 },
+            "/" => {
+                if b != 0 {
+                    a.wrapping_div(b)
+                } else {
+                    0
+                }
+            }
+            "%" => {
+                if b != 0 {
+                    a.wrapping_rem(b)
+                } else {
+                    0
+                }
+            }
             "&" => a & b,
             "|" => a | b,
             "^" => a ^ b,
@@ -949,8 +995,14 @@ impl<'a> Interp<'a> {
             }),
             // ReadString(pos?, maxLen?) — NUL-terminated string, no advance.
             "ReadString" => {
-                let at = args.first().map(|v| v.as_i64() as usize).unwrap_or(self.pos);
-                let max = args.get(1).map(|v| v.as_i64() as usize).unwrap_or(usize::MAX);
+                let at = args
+                    .first()
+                    .map(|v| v.as_i64() as usize)
+                    .unwrap_or(self.pos);
+                let max = args
+                    .get(1)
+                    .map(|v| v.as_i64() as usize)
+                    .unwrap_or(usize::MAX);
                 let mut s = String::new();
                 let mut i = at;
                 while i < self.data.len() && s.len() < max {
@@ -981,8 +1033,16 @@ impl<'a> Interp<'a> {
                 let n = n.min(self.data.len());
                 let mut res = 0i64;
                 for k in 0..n {
-                    let x = p1.checked_add(k).and_then(|i| self.data.get(i)).copied().unwrap_or(0);
-                    let y = p2.checked_add(k).and_then(|i| self.data.get(i)).copied().unwrap_or(0);
+                    let x = p1
+                        .checked_add(k)
+                        .and_then(|i| self.data.get(i))
+                        .copied()
+                        .unwrap_or(0);
+                    let y = p2
+                        .checked_add(k)
+                        .and_then(|i| self.data.get(i))
+                        .copied()
+                        .unwrap_or(0);
                     if x != y {
                         res = x as i64 - y as i64;
                         break;
@@ -992,8 +1052,16 @@ impl<'a> Interp<'a> {
             }
             // Strcmp(a, b) — string compare, C-style sign.
             "Strcmp" => {
-                let sa = if let Some(Value::Str(s)) = args.first() { s.as_str() } else { "" };
-                let sb = if let Some(Value::Str(s)) = args.get(1) { s.as_str() } else { "" };
+                let sa = if let Some(Value::Str(s)) = args.first() {
+                    s.as_str()
+                } else {
+                    ""
+                };
+                let sb = if let Some(Value::Str(s)) = args.get(1) {
+                    s.as_str()
+                } else {
+                    ""
+                };
                 Value::Int(match sa.cmp(sb) {
                     std::cmp::Ordering::Less => -1,
                     std::cmp::Ordering::Equal => 0,
@@ -1006,12 +1074,8 @@ impl<'a> Interp<'a> {
                 Value::Void
             }
             "Abs" => Value::Int(a0().as_i64().saturating_abs()),
-            "Min" => Value::Int(
-                args.iter().map(|v| v.as_i64()).min().unwrap_or(0),
-            ),
-            "Max" => Value::Int(
-                args.iter().map(|v| v.as_i64()).max().unwrap_or(0),
-            ),
+            "Min" => Value::Int(args.iter().map(|v| v.as_i64()).min().unwrap_or(0)),
+            "Max" => Value::Int(args.iter().map(|v| v.as_i64()).max().unwrap_or(0)),
             _ => return Ok(None),
         };
         Ok(Some(v))
@@ -1023,7 +1087,10 @@ impl<'a> Interp<'a> {
         // A negative position argument casts to a huge usize; use checked math
         // so it (and any out-of-range position) returns 0 instead of overflow-
         // panicking on `at + size` or OOB-slicing `self.data[at..]`.
-        let at = args.first().map(|v| v.as_i64() as usize).unwrap_or(self.pos);
+        let at = args
+            .first()
+            .map(|v| v.as_i64() as usize)
+            .unwrap_or(self.pos);
         let end = match at.checked_add(size) {
             Some(e) if e <= self.data.len() => e,
             _ => return Value::Int(0),
@@ -1205,7 +1272,9 @@ fn decode_primitive(bytes: &[u8], kind: Kind, le: bool) -> Value {
 
 fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
     if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
-        a.as_f64().partial_cmp(&b.as_f64()).unwrap_or(std::cmp::Ordering::Equal)
+        a.as_f64()
+            .partial_cmp(&b.as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
     } else {
         a.as_i64().cmp(&b.as_i64())
     }

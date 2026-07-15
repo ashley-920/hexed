@@ -32,12 +32,10 @@ pub use export::{
 };
 pub use hashes::{adler32, crc16, crc32, hash_all, md5_hex, sha256_hex, Hashes};
 pub use histogram::{byte_histogram, Histogram};
-pub use ioc::{defang, extract_iocs, Ioc, IocKind};
-pub use pe::{
-    imphash, parse_pe, suspicious_apis, ApiFlag, PeExport, PeImport, PeInfo, PeSection,
-};
 pub use inspect::{inspect, ymd_utc, Endian, Interpretation};
+pub use ioc::{defang, extract_iocs, Ioc, IocKind};
 pub use ops::{apply as apply_block_op, BlockOp};
+pub use pe::{imphash, parse_pe, suspicious_apis, ApiFlag, PeExport, PeImport, PeInfo, PeSection};
 pub use search::{find_bytes, find_pattern, find_text, parse_hex_pattern, PatByte};
 pub use signatures::{scan_signatures, SigHit};
 pub use strings::{find_strings, FoundString, StringKind};

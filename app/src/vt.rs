@@ -158,7 +158,9 @@ impl Vt {
     }
 
     pub fn icon_pending(&self, dhash: &str) -> bool {
-        self.icon_inflight.as_ref().is_some_and(|(d, _)| d == dhash.trim())
+        self.icon_inflight
+            .as_ref()
+            .is_some_and(|(d, _)| d == dhash.trim())
     }
 
     pub fn get(&self, hash: &str) -> Option<&VtVerdict> {
@@ -182,16 +184,24 @@ fn load_key() -> Option<String> {
             }
         }
     }
-    std::env::var("VT_API_KEY").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::env::var("VT_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// One blocking VT v3 file lookup (runs on a worker thread).
 fn lookup(key: &str, hash: &str) -> VtVerdict {
     let url = format!("https://www.virustotal.com/api/v3/files/{hash}");
-    let req = ureq::get(&url).set("x-apikey", key).timeout(Duration::from_secs(20));
+    let req = ureq::get(&url)
+        .set("x-apikey", key)
+        .timeout(Duration::from_secs(20));
     match req.call() {
         Ok(resp) => parse(resp),
-        Err(ureq::Error::Status(404, _)) => VtVerdict { not_found: true, ..Default::default() },
+        Err(ureq::Error::Status(404, _)) => VtVerdict {
+            not_found: true,
+            ..Default::default()
+        },
         Err(ureq::Error::Status(401, _)) => err("invalid VT API key"),
         Err(ureq::Error::Status(429, _)) => err("VT rate limit — try again shortly"),
         Err(ureq::Error::Status(code, _)) => err(&format!("VT error {code}")),
@@ -200,7 +210,10 @@ fn lookup(key: &str, hash: &str) -> VtVerdict {
 }
 
 fn err(msg: &str) -> VtVerdict {
-    VtVerdict { error: Some(msg.to_string()), ..Default::default() }
+    VtVerdict {
+        error: Some(msg.to_string()),
+        ..Default::default()
+    }
 }
 
 fn parse(resp: ureq::Response) -> VtVerdict {
@@ -263,7 +276,11 @@ fn icon_search(key: &str, dhash: &str) -> IconMatches {
     let url = format!(
         "https://www.virustotal.com/api/v3/intelligence/search?query=main_icon_dhash:{dhash}&limit=1"
     );
-    match ureq::get(&url).set("x-apikey", key).timeout(Duration::from_secs(25)).call() {
+    match ureq::get(&url)
+        .set("x-apikey", key)
+        .timeout(Duration::from_secs(25))
+        .call()
+    {
         Ok(resp) => {
             let j: serde_json::Value = resp.into_json().unwrap_or_default();
             // total across all pages; fall back to this page's count.
@@ -271,7 +288,10 @@ fn icon_search(key: &str, dhash: &str) -> IconMatches {
                 .as_u64()
                 .or_else(|| j["meta"]["count"].as_u64())
                 .unwrap_or_else(|| j["data"].as_array().map(|a| a.len() as u64).unwrap_or(0));
-            IconMatches { count: count as u32, error: None }
+            IconMatches {
+                count: count as u32,
+                error: None,
+            }
         }
         Err(ureq::Error::Status(403, _)) => IconMatches {
             count: 0,
@@ -281,6 +301,9 @@ fn icon_search(key: &str, dhash: &str) -> IconMatches {
             count: 0,
             error: Some("VT rate limit".into()),
         },
-        Err(e) => IconMatches { count: 0, error: Some(format!("VT: {e}")) },
+        Err(e) => IconMatches {
+            count: 0,
+            error: Some(format!("VT: {e}")),
+        },
     }
 }

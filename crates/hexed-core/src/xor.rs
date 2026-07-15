@@ -26,7 +26,10 @@ fn parse_hex_key(s: &str) -> Option<Vec<u8>> {
         .filter(|g| !g.is_empty())
         .collect();
     let strip0x = |g: &str| -> String {
-        g.strip_prefix("0x").or_else(|| g.strip_prefix("0X")).unwrap_or(g).to_string()
+        g.strip_prefix("0x")
+            .or_else(|| g.strip_prefix("0X"))
+            .unwrap_or(g)
+            .to_string()
     };
     if groups.len() > 1 {
         let mut out = Vec::with_capacity(groups.len());
@@ -116,7 +119,11 @@ pub fn brute_force_single_byte(src: &[u8]) -> Vec<ScoredKey> {
         let score = (sum.max(0) as f32 / denom).clamp(0.0, 1.0);
         scored.push(ScoredKey { key, score });
     }
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored
 }
 

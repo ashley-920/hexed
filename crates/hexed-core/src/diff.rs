@@ -71,11 +71,17 @@ pub fn diff_aligned(a: &[u8], b: &[u8]) -> DiffResult {
                 run_start = Some(i);
             }
         } else if let Some(s) = run_start.take() {
-            runs.push(DiffRun { start: s, len: i - s });
+            runs.push(DiffRun {
+                start: s,
+                len: i - s,
+            });
         }
     }
     if let Some(s) = run_start {
-        runs.push(DiffRun { start: s, len: compared - s });
+        runs.push(DiffRun {
+            start: s,
+            len: compared - s,
+        });
     }
 
     DiffResult {
@@ -116,10 +122,7 @@ mod tests {
         // runs: [2..4) and [7..9)
         assert_eq!(
             d.runs,
-            vec![
-                DiffRun { start: 2, len: 2 },
-                DiffRun { start: 7, len: 2 },
-            ]
+            vec![DiffRun { start: 2, len: 2 }, DiffRun { start: 7, len: 2 },]
         );
         assert_eq!(d.runs[1].end(), 9);
     }

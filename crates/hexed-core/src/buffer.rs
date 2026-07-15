@@ -37,7 +37,14 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn from_bytes(data: Vec<u8>) -> Self {
-        Buffer { data, path: None, undo: Vec::new(), redo: Vec::new(), dirty: false, gen: 0 }
+        Buffer {
+            data,
+            path: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            dirty: false,
+            gen: 0,
+        }
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
@@ -117,7 +124,10 @@ impl Buffer {
             return;
         }
         self.data.splice(offset..offset, bytes.iter().copied());
-        self.undo.push(Edit::Delete { offset, len: bytes.len() });
+        self.undo.push(Edit::Delete {
+            offset,
+            len: bytes.len(),
+        });
         self.redo.clear();
         self.mark_modified();
     }
@@ -129,7 +139,10 @@ impl Buffer {
         }
         let end = (offset + len).min(self.data.len());
         let removed: Vec<u8> = self.data.splice(offset..end, std::iter::empty()).collect();
-        self.undo.push(Edit::Insert { offset, bytes: removed });
+        self.undo.push(Edit::Insert {
+            offset,
+            bytes: removed,
+        });
         self.redo.clear();
         self.mark_modified();
     }
@@ -150,9 +163,11 @@ impl Buffer {
             }
             Edit::Delete { offset, len } => {
                 let end = (offset + len).min(self.data.len());
-                let removed: Vec<u8> =
-                    self.data.splice(offset..end, std::iter::empty()).collect();
-                Edit::Insert { offset, bytes: removed }
+                let removed: Vec<u8> = self.data.splice(offset..end, std::iter::empty()).collect();
+                Edit::Insert {
+                    offset,
+                    bytes: removed,
+                }
             }
             Edit::Replace { bytes } => {
                 let old = std::mem::replace(&mut self.data, bytes);
@@ -202,7 +217,7 @@ impl Buffer {
                 self.dirty = false;
                 Ok(())
             }
-            None => Err(io::Error::new(io::ErrorKind::Other, "buffer has no path; use save_as")),
+            None => Err(io::Error::other("buffer has no path; use save_as")),
         }
     }
 
@@ -276,7 +291,11 @@ mod tests {
         let g6 = b.generation();
         b.overwrite(99, &[1]); // out of range -> no-op
         b.replace_all(b"xyz".to_vec()); // identical -> no-op
-        assert_eq!(g6, b.generation(), "no-op mutations must not bump generation");
+        assert_eq!(
+            g6,
+            b.generation(),
+            "no-op mutations must not bump generation"
+        );
     }
 
     #[test]

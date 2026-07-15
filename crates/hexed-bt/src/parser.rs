@@ -28,7 +28,11 @@ impl std::fmt::Display for ParseError {
 const MAX_PARSE_DEPTH: u32 = 64;
 
 pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
-    let mut p = Parser { toks: tokens, pos: 0, depth: 0 };
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+        depth: 0,
+    };
     let mut items = Vec::new();
     while !p.at_eof() {
         items.push(p.parse_stmt()?);
@@ -77,7 +81,10 @@ impl<'a> Parser<'a> {
         matches!(self.kind_at(0), Some(TokKind::Eof) | None)
     }
     fn err<T>(&self, msg: impl Into<String>) -> Result<T, ParseError> {
-        Err(ParseError { msg: msg.into(), pos: self.byte_pos() })
+        Err(ParseError {
+            msg: msg.into(),
+            pos: self.byte_pos(),
+        })
     }
     fn at_punct(&self, p: &str) -> bool {
         matches!(self.kind_at(0), Some(TokKind::Punct(q)) if *q == p)
@@ -147,7 +154,11 @@ impl<'a> Parser<'a> {
             return self.parse_do();
         }
         if self.eat_kw("return") {
-            let e = if self.at_punct(";") { None } else { Some(self.parse_expr()?) };
+            let e = if self.at_punct(";") {
+                None
+            } else {
+                Some(self.parse_expr()?)
+            };
             self.expect_punct(";")?;
             return Ok(Stmt::Return(e));
         }
@@ -174,8 +185,12 @@ impl<'a> Parser<'a> {
     }
 
     fn looks_like_decl(&self) -> bool {
-        if self.at_kw("struct") || self.at_kw("union") || self.at_kw("enum")
-            || self.at_kw("typedef") || self.at_kw("local") || self.at_kw("const")
+        if self.at_kw("struct")
+            || self.at_kw("union")
+            || self.at_kw("enum")
+            || self.at_kw("typedef")
+            || self.at_kw("local")
+            || self.at_kw("const")
         {
             return true;
         }
@@ -246,12 +261,25 @@ impl<'a> Parser<'a> {
             self.expect_punct(";")?;
             Some(Box::new(Stmt::Expr(e)))
         };
-        let cond = if self.at_punct(";") { None } else { Some(self.parse_expr()?) };
+        let cond = if self.at_punct(";") {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
         self.expect_punct(";")?;
-        let step = if self.at_punct(")") { None } else { Some(self.parse_expr()?) };
+        let step = if self.at_punct(")") {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
         self.expect_punct(")")?;
         let body = Box::new(self.parse_stmt()?);
-        Ok(Stmt::For { init, cond, step, body })
+        Ok(Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        })
     }
 
     // ---- declarations ----
@@ -281,18 +309,39 @@ impl<'a> Parser<'a> {
         if self.at_punct("(") && !is_typedef {
             let params = self.parse_params()?;
             let body = self.parse_block()?;
-            return Ok(Decl::Func(FuncDef { ret: ty, name, params, body }));
+            return Ok(Decl::Func(FuncDef {
+                ret: ty,
+                name,
+                params,
+                body,
+            }));
         }
 
         let array = self.parse_array_opt()?;
         let attrs = self.parse_attrs()?;
-        let init = if self.eat_punct("=") { Some(self.parse_expr()?) } else { None };
+        let init = if self.eat_punct("=") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         self.expect_punct(";")?;
 
         if is_typedef {
-            Ok(Decl::Typedef { ty, name, array, attrs })
+            Ok(Decl::Typedef {
+                ty,
+                name,
+                array,
+                attrs,
+            })
         } else {
-            Ok(Decl::Var(VarDecl { ty, name, array, local: is_local, attrs, init }))
+            Ok(Decl::Var(VarDecl {
+                ty,
+                name,
+                array,
+                local: is_local,
+                attrs,
+                init,
+            }))
         }
     }
 
@@ -325,7 +374,12 @@ impl<'a> Parser<'a> {
             None
         };
         let attrs = self.parse_attrs()?;
-        Ok(StructDef { is_union, name, body, attrs })
+        Ok(StructDef {
+            is_union,
+            name,
+            body,
+            attrs,
+        })
     }
 
     fn parse_enum_rest(&mut self) -> Result<EnumDef, ParseError> {
@@ -345,7 +399,11 @@ impl<'a> Parser<'a> {
         if self.eat_punct("{") {
             while !self.at_punct("}") && !self.at_eof() {
                 let vname = self.expect_ident()?;
-                let val = if self.eat_punct("=") { Some(self.parse_expr()?) } else { None };
+                let val = if self.eat_punct("=") {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
                 variants.push((vname, val));
                 if !self.eat_punct(",") {
                     break;
@@ -354,7 +412,12 @@ impl<'a> Parser<'a> {
             self.expect_punct("}")?;
         }
         let attrs = self.parse_attrs()?;
-        Ok(EnumDef { name, base, variants, attrs })
+        Ok(EnumDef {
+            name,
+            base,
+            variants,
+            attrs,
+        })
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
@@ -366,7 +429,12 @@ impl<'a> Parser<'a> {
             let is_ref = self.eat_punct("&");
             let name = self.expect_ident()?;
             let array = self.parse_array_opt()?.is_some();
-            params.push(Param { ty, name, is_ref, array });
+            params.push(Param {
+                ty,
+                name,
+                is_ref,
+                array,
+            });
             if !self.eat_punct(",") {
                 break;
             }
@@ -435,7 +503,11 @@ impl<'a> Parser<'a> {
                 let op = *op;
                 self.pos += 1;
                 let value = self.parse_expr()?; // right assoc
-                return Ok(Expr::Assign { op, target: Box::new(lhs), value: Box::new(value) });
+                return Ok(Expr::Assign {
+                    op,
+                    target: Box::new(lhs),
+                    value: Box::new(value),
+                });
             }
         }
         Ok(lhs)
@@ -466,7 +538,11 @@ impl<'a> Parser<'a> {
             let op = *op;
             self.pos += 1;
             let rhs = self.parse_binary(prec + 1)?; // left assoc
-            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -491,7 +567,11 @@ impl<'a> Parser<'a> {
                 let op = *op;
                 self.pos += 1;
                 let expr = self.parse_unary()?;
-                return Ok(Expr::Unary { op, prefix: true, expr: Box::new(expr) });
+                return Ok(Expr::Unary {
+                    op,
+                    prefix: true,
+                    expr: Box::new(expr),
+                });
             }
         }
         if self.eat_kw("sizeof") {
@@ -519,21 +599,39 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect_punct(")")?;
-                e = Expr::Call { callee: Box::new(e), args };
+                e = Expr::Call {
+                    callee: Box::new(e),
+                    args,
+                };
             } else if self.eat_punct("[") {
                 let index = self.parse_expr()?;
                 self.expect_punct("]")?;
-                e = Expr::Index { base: Box::new(e), index: Box::new(index) };
+                e = Expr::Index {
+                    base: Box::new(e),
+                    index: Box::new(index),
+                };
             } else if self.eat_punct(".") {
                 let name = self.expect_ident()?;
-                e = Expr::Member { base: Box::new(e), name, arrow: false };
+                e = Expr::Member {
+                    base: Box::new(e),
+                    name,
+                    arrow: false,
+                };
             } else if self.eat_punct("->") {
                 let name = self.expect_ident()?;
-                e = Expr::Member { base: Box::new(e), name, arrow: true };
+                e = Expr::Member {
+                    base: Box::new(e),
+                    name,
+                    arrow: true,
+                };
             } else if self.at_punct("++") || self.at_punct("--") {
                 let op = if self.at_punct("++") { "++" } else { "--" };
                 self.pos += 1;
-                e = Expr::Unary { op, prefix: false, expr: Box::new(e) };
+                e = Expr::Unary {
+                    op,
+                    prefix: false,
+                    expr: Box::new(e),
+                };
             } else {
                 break;
             }
@@ -648,7 +746,9 @@ mod tests {
 
         // The typedef of a struct with a body + attrs.
         match &p[0] {
-            Stmt::Decl(Decl::Typedef { ty, name, attrs, .. }) => {
+            Stmt::Decl(Decl::Typedef {
+                ty, name, attrs, ..
+            }) => {
                 assert_eq!(name, "CHUNK");
                 assert_eq!(attrs.0[0].0, "bgcolor");
                 let TypeRef::Struct(s) = ty else { panic!() };
@@ -685,10 +785,8 @@ mod tests {
 
     #[test]
     fn enum_and_if_else() {
-        let p = parse_src(
-            "enum <uint16> Kind { A, B = 5, C }; if (x > 1) return 2; else break;",
-        )
-        .unwrap();
+        let p = parse_src("enum <uint16> Kind { A, B = 5, C }; if (x > 1) return 2; else break;")
+            .unwrap();
         match &p[0] {
             Stmt::Decl(Decl::Enum(e)) => {
                 assert_eq!(e.base, Some("uint16".into()));
