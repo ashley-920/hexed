@@ -519,6 +519,41 @@ fn sniff(text: &str) -> Lang {
     Lang::Plain
 }
 
+/// The languages offered in the manual override picker, with display names.
+pub fn selectable() -> &'static [(&'static str, Lang)] {
+    &[
+        ("JavaScript / TS", Lang::Generic(JS)),
+        ("C / C++ / C#", Lang::Generic(C_LIKE)),
+        ("Python", Lang::Generic(PY)),
+        ("PowerShell", Lang::Generic(PS)),
+        ("Shell / Bash", Lang::Generic(SH)),
+        ("Batch / CMD", Lang::Generic(BAT)),
+        ("VBScript / VBA", Lang::Generic(VBS)),
+        ("PHP / Perl", Lang::Generic(PHP)),
+        ("JSON", Lang::Json),
+        ("XML / HTML", Lang::Xml),
+        ("Markdown", Lang::Markdown),
+        ("YARA", Lang::Yara),
+        ("Plain text", Lang::Plain),
+    ]
+}
+
+/// Display name for a detected or picked language.
+pub fn name(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Plain => "Plain text",
+        Lang::Json => "JSON",
+        Lang::Xml => "XML / HTML",
+        Lang::Markdown => "Markdown",
+        Lang::Yara => "YARA",
+        Lang::Generic(s) => selectable()
+            .iter()
+            .find(|(_, l)| *l == Lang::Generic(s))
+            .map(|(nm, _)| *nm)
+            .unwrap_or("Code"),
+    }
+}
+
 // ---- job builder ------------------------------------------------------------
 
 /// Build a coloured [`LayoutJob`] for `text` in `lang`. `wrap` is left at the

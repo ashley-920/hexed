@@ -315,6 +315,9 @@ struct Document {
     text_gen: u64,
     /// Whether `text_buf` has edits not yet committed to the byte buffer.
     text_dirty: bool,
+    /// Manual Text-view language override (`None` = auto-detect). Lets the user
+    /// force e.g. VBScript on a decoded `.vbe` saved as `.txt`.
+    text_lang_override: Option<highlight::Lang>,
     /// Which nibble the hex-edit caret is on (false = high, true = low).
     hex_low_nibble: bool,
     /// Whether hex-view typing edits the ASCII pane (true) or hex pane (false).
@@ -371,6 +374,7 @@ impl Document {
             text_buf: String::new(),
             text_gen: u64::MAX,
             text_dirty: false,
+            text_lang_override: None,
             hex_low_nibble: false,
             edit_ascii: false,
             derived_ttl: 0,
@@ -4553,6 +4557,48 @@ impl HexedApp {
             ui.add_space(2.0);
         }
 
+        // Manual language-override picker: auto-detection keys off the extension,
+        // so a decoded `.vbe` saved as `.txt` needs a way to force VBScript.
+        if editable {
+            if let Some(d) = self.docs.get_mut(active) {
+                let detected = if d.text_buf.len() <= HL_LIMIT {
+                    highlight::detect(&d.file_name, &d.text_buf)
+                } else {
+                    highlight::Lang::Plain
+                };
+                ui.horizontal(|ui| {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("Syntax").weak().size(11.0));
+                    let current = d.text_lang_override.unwrap_or(detected);
+                    egui::ComboBox::from_id_salt("text_lang_picker")
+                        .selected_text(highlight::name(current))
+                        .height(360.0) // show every language without scrolling
+                        .show_ui(ui, |ui| {
+                            let auto = format!("Auto · {}", highlight::name(detected));
+                            if ui
+                                .selectable_label(d.text_lang_override.is_none(), auto)
+                                .clicked()
+                            {
+                                d.text_lang_override = None;
+                            }
+                            ui.separator();
+                            for (nm, lang) in highlight::selectable() {
+                                if ui
+                                    .selectable_label(d.text_lang_override == Some(*lang), *nm)
+                                    .clicked()
+                                {
+                                    d.text_lang_override = Some(*lang);
+                                }
+                            }
+                        });
+                    if d.text_lang_override.is_some() {
+                        ui.label(egui::RichText::new("· override").weak().size(10.0));
+                    }
+                });
+                ui.add_space(2.0);
+            }
+        }
+
         // Syntax colours must be pulled from the palette BEFORE we mutably borrow
         // self.docs below (the layouter captures them by value).
         let colors = highlight::SyntaxColors::from(&self.palette);
@@ -4566,7 +4612,8 @@ impl HexedApp {
                     // colour via a layouter — but only for real, not-too-large
                     // UTF-8 text; binaries / huge files render plain.
                     let lang = if editable && d.text_buf.len() <= HL_LIMIT {
-                        highlight::detect(&d.file_name, &d.text_buf)
+                        d.text_lang_override
+                            .unwrap_or_else(|| highlight::detect(&d.file_name, &d.text_buf))
                     } else {
                         highlight::Lang::Plain
                     };
