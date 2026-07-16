@@ -20,6 +20,7 @@ pub enum Lang {
     Json,
     Xml,
     Markdown,
+    Yara,
 }
 
 /// A token class, mapped to a colour by [`SyntaxColors::of`].
@@ -463,6 +464,7 @@ pub fn detect(file_name: &str, text: &str) -> Lang {
             return Lang::Xml
         }
         "md" | "markdown" | "mdown" => return Lang::Markdown,
+        "yar" | "yara" => return Lang::Yara,
         _ => {}
     }
     sniff(text)
@@ -494,6 +496,14 @@ fn sniff(text: &str) -> Lang {
     if head.starts_with("<?php") {
         return Lang::Generic(PHP);
     }
+    // YARA: a `rule <name> {` / `import "..."` header with a condition section.
+    if (head.starts_with("rule ")
+        || head.starts_with("import \"")
+        || head.starts_with("private rule"))
+        && head.contains("condition:")
+    {
+        return Lang::Yara;
+    }
     if head.starts_with("<?xml") || head.starts_with("<!DOCTYPE") || head.starts_with('<') {
         return Lang::Xml;
     }
@@ -521,6 +531,7 @@ pub fn layout_job(text: &str, lang: Lang, colors: &SyntaxColors, font: FontId) -
         Lang::Json => tokenize_json(text.as_bytes(), &mut spans),
         Lang::Xml => tokenize_xml(text.as_bytes(), &mut spans),
         Lang::Markdown => tokenize_markdown(text.as_bytes(), &mut spans),
+        Lang::Yara => tokenize_yara(text.as_bytes(), &mut spans),
     }
 
     let mut job = LayoutJob::default();
@@ -695,6 +706,214 @@ fn is_keyword(word: &[u8], spec: &Spec) -> bool {
         }
     };
     spec.keywords.iter().any(|kw| matches(kw))
+}
+
+// ---- YARA -------------------------------------------------------------------
+
+const YARA_KW: &[&str] = &[
+    "rule",
+    "private",
+    "global",
+    "import",
+    "include",
+    "meta",
+    "strings",
+    "condition",
+    "and",
+    "or",
+    "not",
+    "all",
+    "any",
+    "none",
+    "of",
+    "them",
+    "for",
+    "in",
+    "at",
+    "entrypoint",
+    "filesize",
+    "matches",
+    "contains",
+    "icontains",
+    "startswith",
+    "istartswith",
+    "endswith",
+    "iendswith",
+    "defined",
+    "nocase",
+    "wide",
+    "ascii",
+    "xor",
+    "base64",
+    "base64wide",
+    "fullword",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint8be",
+    "uint16be",
+    "uint32be",
+    "uint64be",
+    "int8be",
+    "int16be",
+    "int32be",
+    "int64be",
+];
+
+/// If `{` at `open` begins a hex byte-pattern (only hex digits, wildcards, jumps
+/// and alternation inside), return the index just past its `}`. Rule bodies —
+/// whose braces hold section labels and text — return `None`, so a bare `{` is
+/// left as normal punctuation.
+fn yara_hex_end(src: &[u8], open: usize) -> Option<usize> {
+    let n = src.len();
+    let mut j = open + 1;
+    let mut saw_hex = false;
+    while j < n {
+        let c = src[j];
+        if c == b'}' {
+            return if saw_hex { Some(j + 1) } else { None };
+        }
+        if c.is_ascii_hexdigit() {
+            saw_hex = true;
+        } else if !matches!(
+            c,
+            b' ' | b'\t'
+                | b'\r'
+                | b'\n'
+                | b'?'
+                | b'['
+                | b']'
+                | b'-'
+                | b'('
+                | b')'
+                | b'|'
+                | b','
+                | b'~'
+        ) {
+            return None; // anything else -> this is a rule body, not a hex string
+        }
+        j += 1;
+    }
+    None
+}
+
+fn tokenize_yara(src: &[u8], out: &mut Vec<Span>) {
+    let n = src.len();
+    let mut i = 0;
+    while i < n {
+        let b = src[i];
+        // block comment
+        if src[i..].starts_with(b"/*") {
+            let start = i;
+            i += 2;
+            while i < n && !src[i..].starts_with(b"*/") {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            out.push(Span::new(start, i, Tok::Comment));
+            continue;
+        }
+        // line comment
+        if src[i..].starts_with(b"//") {
+            let start = i;
+            while i < n && src[i] != b'\n' {
+                i += 1;
+            }
+            out.push(Span::new(start, i, Tok::Comment));
+            continue;
+        }
+        // regex  /.../modifiers  (a '/' not starting a comment and not a spaced
+        // division operator, closed by an unescaped '/' on the same line)
+        if b == b'/' && i + 1 < n && !matches!(src[i + 1], b'/' | b'*' | b' ' | b'\t') {
+            let mut j = i + 1;
+            let mut ok = false;
+            while j < n && src[j] != b'\n' {
+                if src[j] == b'\\' && j + 1 < n {
+                    j += 2;
+                    continue;
+                }
+                if src[j] == b'/' {
+                    j += 1;
+                    ok = true;
+                    break;
+                }
+                j += 1;
+            }
+            if ok {
+                while j < n && src[j].is_ascii_alphabetic() {
+                    j += 1; // regex modifiers (i, s, ...)
+                }
+                out.push(Span::new(i, j, Tok::Str));
+                i = j;
+                continue;
+            }
+        }
+        // text string
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < n {
+                if src[i] == b'\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                if src[i] == b'"' || src[i] == b'\n' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push(Span::new(start, i, Tok::Str));
+            continue;
+        }
+        // hex byte-pattern  { .. }
+        if b == b'{' {
+            if let Some(end) = yara_hex_end(src, i) {
+                out.push(Span::new(i, end, Tok::Str));
+                i = end;
+                continue;
+            }
+        }
+        // string identifiers: $name #name @name !name
+        if matches!(b, b'$' | b'#' | b'@' | b'!') {
+            let start = i;
+            i += 1;
+            while i < n && (is_word(src[i]) || src[i] == b'*') {
+                i += 1;
+            }
+            out.push(Span::new(start, i, Tok::Prop));
+            continue;
+        }
+        // numbers (decimal / 0x hex, optional KB/MB suffix)
+        if b.is_ascii_digit() {
+            let start = i;
+            while i < n && (src[i].is_ascii_alphanumeric() || src[i] == b'.') {
+                i += 1;
+            }
+            out.push(Span::new(start, i, Tok::Number));
+            continue;
+        }
+        // identifiers / keywords / literals
+        if is_word(b) && !b.is_ascii_digit() {
+            let start = i;
+            while i < n && is_word(src[i]) {
+                i += 1;
+            }
+            let word = &src[start..i];
+            if word == b"true" || word == b"false" {
+                out.push(Span::new(start, i, Tok::Literal));
+            } else if YARA_KW.iter().any(|k| k.as_bytes() == word) {
+                out.push(Span::new(start, i, Tok::Keyword));
+            }
+            continue;
+        }
+        i += 1;
+    }
 }
 
 // ---- JSON -------------------------------------------------------------------
