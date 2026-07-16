@@ -24,7 +24,7 @@ pub enum Lang {
 }
 
 /// A token class, mapped to a colour by [`SyntaxColors::of`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tok {
     Comment,
     Str,
@@ -59,17 +59,29 @@ pub struct SyntaxColors {
 
 impl SyntaxColors {
     pub fn from(pal: &Palette) -> Self {
+        // Keywords / tags / headings normally take the theme accent. But on a
+        // theme whose accent is itself green (≈ strings) or amber (≈ numbers) that
+        // would be unreadable — and the palette has no other vivid hue that clears
+        // BOTH green and amber (salmon is too close to amber) — so fall back to a
+        // fixed, dark-background-legible blue there. Carbon (cyan) and Violet keep
+        // their accent; Amber and Phosphor use the blue.
+        let keyword = if near(pal.accent, pal.ok) || near(pal.accent, pal.warn) {
+            Color32::from_rgb(0x82, 0xaa, 0xff)
+        } else {
+            pal.accent
+        };
+        let func = pal.b_high;
         SyntaxColors {
             comment: pal.faint,
             string: pal.ok,
-            keyword: pal.accent,
+            keyword,
             number: pal.warn,
             literal: pal.warn,
-            func: pal.b_high,
+            func,
             prop: pal.b_print,
-            tag: pal.accent,
+            tag: keyword,
             attr: pal.b_other,
-            heading: pal.accent,
+            heading: keyword,
             link: pal.b_print,
             normal: pal.text,
         }
@@ -89,6 +101,14 @@ impl SyntaxColors {
             Tok::Link => self.link,
         }
     }
+}
+
+/// Whether two colours are close enough (squared RGB distance) to read as the
+/// same on screen — used to detect a theme accent that collides with the fixed
+/// string/number colours.
+fn near(a: Color32, b: Color32) -> bool {
+    let sq = |x: u8, y: u8| (x as i32 - y as i32).pow(2);
+    sq(a.r(), b.r()) + sq(a.g(), b.g()) + sq(a.b(), b.b()) < 3600
 }
 
 /// A coloured run: `[start, end)` bytes → token class.
@@ -1137,5 +1157,205 @@ fn tokenize_markdown(src: &[u8], out: &mut Vec<Span>) {
             }
         }
         i += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spans(text: &str, lang: Lang) -> Vec<(usize, usize, Tok)> {
+        let mut v = Vec::new();
+        match lang {
+            Lang::Plain => {}
+            Lang::Generic(s) => tokenize_generic(text.as_bytes(), &s, &mut v),
+            Lang::Json => tokenize_json(text.as_bytes(), &mut v),
+            Lang::Xml => tokenize_xml(text.as_bytes(), &mut v),
+            Lang::Markdown => tokenize_markdown(text.as_bytes(), &mut v),
+            Lang::Yara => tokenize_yara(text.as_bytes(), &mut v),
+        }
+        v.iter().map(|s| (s.start, s.end, s.tok)).collect()
+    }
+
+    /// Token class covering the first byte of `needle` in `text`.
+    fn tok_of(text: &str, lang: Lang, needle: &str) -> Option<Tok> {
+        let at = text.find(needle)?;
+        spans(text, lang)
+            .into_iter()
+            .find(|(s, e, _)| *s <= at && at < *e)
+            .map(|(_, _, t)| t)
+    }
+
+    /// The invariant `layout_job` relies on: spans are ordered, non-overlapping,
+    /// in-bounds, and land on char boundaries so slicing can never panic.
+    fn assert_clean(text: &str, lang: Lang) {
+        let mut cursor = 0;
+        for (s, e, _) in spans(text, lang) {
+            assert!(s >= cursor, "out-of-order span {s} < {cursor} in {text:?}");
+            assert!(e > s, "empty/reversed span {s}..{e} in {text:?}");
+            assert!(e <= text.len(), "span end {e} > len in {text:?}");
+            assert!(
+                text.is_char_boundary(s) && text.is_char_boundary(e),
+                "non-char-boundary span {s}..{e} in {text:?}"
+            );
+            cursor = e;
+        }
+    }
+
+    #[test]
+    fn detection_by_extension() {
+        assert_eq!(detect("a.js", ""), Lang::Generic(JS));
+        assert_eq!(detect("a.ps1", ""), Lang::Generic(PS));
+        assert_eq!(detect("a.vbs", ""), Lang::Generic(VBS));
+        assert_eq!(detect("a.py", ""), Lang::Generic(PY));
+        assert_eq!(detect("a.json", ""), Lang::Json);
+        assert_eq!(detect("a.html", ""), Lang::Xml);
+        assert_eq!(detect("a.md", ""), Lang::Markdown);
+        assert_eq!(detect("rules.yar", ""), Lang::Yara);
+        assert_eq!(detect("noext", ""), Lang::Plain);
+    }
+
+    #[test]
+    fn detection_by_content() {
+        assert_eq!(detect("x", "#!/bin/bash\necho hi"), Lang::Generic(SH));
+        assert_eq!(detect("x", "#!/usr/bin/env python3\n"), Lang::Generic(PY));
+        assert_eq!(detect("x", "<?php echo 1;"), Lang::Generic(PHP));
+        assert_eq!(detect("x", "<?xml version=\"1.0\"?>"), Lang::Xml);
+        assert_eq!(detect("x", "{\n  \"a\": 1\n}"), Lang::Json);
+        assert_eq!(detect("x", "rule Foo {\n condition: true\n}"), Lang::Yara);
+    }
+
+    #[test]
+    fn generic_js_tokens() {
+        let src = "// c\nlet x = \"str\";\nfoo(42);";
+        let l = Lang::Generic(JS);
+        assert_eq!(tok_of(src, l, "// c"), Some(Tok::Comment));
+        assert_eq!(tok_of(src, l, "let"), Some(Tok::Keyword));
+        assert_eq!(tok_of(src, l, "\"str\""), Some(Tok::Str));
+        assert_eq!(tok_of(src, l, "42"), Some(Tok::Number));
+        assert_eq!(tok_of(src, l, "foo"), Some(Tok::Func));
+        assert_clean(src, l);
+    }
+
+    #[test]
+    fn ci_keywords_vbscript() {
+        // VBScript keywords match case-insensitively.
+        let src = "Dim x\nSet y = Nothing\nIf a Then\nEnd Function";
+        let l = Lang::Generic(VBS);
+        assert_eq!(tok_of(src, l, "Dim"), Some(Tok::Keyword));
+        assert_eq!(tok_of(src, l, "Then"), Some(Tok::Keyword));
+        assert_eq!(tok_of(src, l, "Function"), Some(Tok::Keyword));
+    }
+
+    #[test]
+    fn json_tokens() {
+        let src = "{ \"key\": \"val\", \"n\": 42, \"ok\": true, \"x\": null }";
+        assert_eq!(tok_of(src, Lang::Json, "\"key\""), Some(Tok::Prop));
+        assert_eq!(tok_of(src, Lang::Json, "\"val\""), Some(Tok::Str));
+        assert_eq!(tok_of(src, Lang::Json, "42"), Some(Tok::Number));
+        assert_eq!(tok_of(src, Lang::Json, "true"), Some(Tok::Literal));
+        assert_eq!(tok_of(src, Lang::Json, "null"), Some(Tok::Literal));
+        assert_clean(src, Lang::Json);
+    }
+
+    #[test]
+    fn xml_tokens() {
+        let src = "<!-- c --><a href=\"u\">t</a>";
+        assert_eq!(tok_of(src, Lang::Xml, "<!--"), Some(Tok::Comment));
+        assert_eq!(tok_of(src, Lang::Xml, "<a"), Some(Tok::Tag));
+        assert_eq!(tok_of(src, Lang::Xml, "href"), Some(Tok::Attr));
+        assert_eq!(tok_of(src, Lang::Xml, "\"u\""), Some(Tok::Str));
+        assert_clean(src, Lang::Xml);
+    }
+
+    #[test]
+    fn markdown_tokens() {
+        let src = "# Head\n- item `code`\n[t](http://u)";
+        assert_eq!(tok_of(src, Lang::Markdown, "# Head"), Some(Tok::Heading));
+        assert_eq!(tok_of(src, Lang::Markdown, "`code`"), Some(Tok::Str));
+        assert_eq!(tok_of(src, Lang::Markdown, "[t]"), Some(Tok::Link));
+        assert_clean(src, Lang::Markdown);
+    }
+
+    #[test]
+    fn yara_tokens() {
+        let src = "rule R { strings:\n $a = \"s\" nocase\n $b = { 4D 5A [2-4] ?? }\n condition: $a and filesize < 10 }";
+        let l = Lang::Yara;
+        assert_eq!(tok_of(src, l, "rule"), Some(Tok::Keyword));
+        assert_eq!(tok_of(src, l, "condition"), Some(Tok::Keyword));
+        assert_eq!(tok_of(src, l, "nocase"), Some(Tok::Keyword));
+        assert_eq!(tok_of(src, l, "and"), Some(Tok::Keyword));
+        assert_eq!(tok_of(src, l, "$a"), Some(Tok::Prop));
+        assert_eq!(tok_of(src, l, "\"s\""), Some(Tok::Str));
+        assert_eq!(tok_of(src, l, "{ 4D"), Some(Tok::Str)); // hex byte-pattern
+        assert_eq!(tok_of(src, l, "10"), Some(Tok::Number));
+        assert_clean(src, l);
+    }
+
+    #[test]
+    fn yara_regex_is_not_a_comment() {
+        // The trickiest YARA case: `/.../ ` is a string, `//` is a comment.
+        let src = "$re = /gate\\.php\\?id=[0-9]+/ ascii\n// a comment";
+        assert_eq!(tok_of(src, Lang::Yara, "/gate"), Some(Tok::Str));
+        assert_eq!(tok_of(src, Lang::Yara, "// a"), Some(Tok::Comment));
+    }
+
+    #[test]
+    fn yara_rule_body_brace_is_not_a_hex_string() {
+        // The `{` opening a rule body (text inside) must NOT be read as hex.
+        let src = "rule R {\n condition: true\n}";
+        assert_eq!(tok_of(src, Lang::Yara, "{\n con"), None);
+    }
+
+    #[test]
+    fn adversarial_inputs_stay_clean() {
+        // Unterminated / malformed input must not panic and must keep the span
+        // invariant (bounded scans, valid boundaries).
+        let cases = [
+            "\"unterminated string",
+            "/* unterminated block",
+            "{ 6A 40 no closing brace",
+            "$",
+            "///",
+            "<tag unterminated",
+            "[link](no close",
+            "",
+            "   ",
+        ];
+        let langs = [
+            Lang::Generic(JS),
+            Lang::Generic(VBS),
+            Lang::Json,
+            Lang::Xml,
+            Lang::Markdown,
+            Lang::Yara,
+        ];
+        for c in cases {
+            for l in langs {
+                assert_clean(c, l);
+            }
+        }
+    }
+
+    #[test]
+    fn keyword_colour_distinct_on_every_theme() {
+        // The theme sanity-check: keywords must never collapse into the string or
+        // number colour on any theme (Amber's amber accent ≈ numbers, Phosphor's
+        // green accent ≈ strings), and keyword must differ from func.
+        for t in crate::theme::Theme::ALL {
+            let c = SyntaxColors::from(&crate::theme::palette(t));
+            assert!(!near(c.keyword, c.string), "keyword ≈ string on {t:?}");
+            assert!(!near(c.keyword, c.number), "keyword ≈ number on {t:?}");
+            assert!(!near(c.func, c.keyword), "func ≈ keyword on {t:?}");
+        }
+    }
+
+    #[test]
+    fn multibyte_utf8_is_safe() {
+        // Non-ASCII bytes inside words/strings must not split a codepoint.
+        let src = "let café = \"naïve → 日本語\"; // 你好";
+        assert_clean(src, Lang::Generic(JS));
+        assert_clean("# 标题 `代码`", Lang::Markdown);
+        assert_clean("{ \"café\": \"naïve\" }", Lang::Json);
     }
 }
