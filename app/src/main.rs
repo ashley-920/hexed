@@ -23,9 +23,39 @@ use hexed_core::{
 };
 
 mod ai;
+mod highlight;
 mod openwith;
 mod theme;
 mod vt;
+
+/// egui frame-cache that memoizes the Text-view syntax-highlight [`LayoutJob`]
+/// so it is only re-tokenized when the text (or language/colours/font) changes,
+/// not every frame. Keyed by `(colours, text, language, font-size-bits)`.
+#[derive(Default)]
+struct Highlighter;
+impl
+    egui::util::cache::ComputerMut<
+        (highlight::SyntaxColors, &str, highlight::Lang, u32),
+        egui::text::LayoutJob,
+    > for Highlighter
+{
+    fn compute(
+        &mut self,
+        (colors, text, lang, font_bits): (highlight::SyntaxColors, &str, highlight::Lang, u32),
+    ) -> egui::text::LayoutJob {
+        highlight::layout_job(
+            text,
+            lang,
+            &colors,
+            FontId::monospace(f32::from_bits(font_bits)),
+        )
+    }
+}
+type HighlightCache = egui::util::cache::FrameCache<egui::text::LayoutJob, Highlighter>;
+
+/// Only syntax-highlight text up to this size; larger files render plain so the
+/// per-frame key hash / tokenization can't cost anything noticeable.
+const HL_LIMIT: usize = 512 * 1024;
 use ai::Ai;
 use theme::{Palette, Theme};
 use vt::Vt;
@@ -285,6 +315,9 @@ struct Document {
     text_gen: u64,
     /// Whether `text_buf` has edits not yet committed to the byte buffer.
     text_dirty: bool,
+    /// Manual Text-view language override (`None` = auto-detect). Lets the user
+    /// force e.g. VBScript on a decoded `.vbe` saved as `.txt`.
+    text_lang_override: Option<highlight::Lang>,
     /// Which nibble the hex-edit caret is on (false = high, true = low).
     hex_low_nibble: bool,
     /// Whether hex-view typing edits the ASCII pane (true) or hex pane (false).
@@ -341,6 +374,7 @@ impl Document {
             text_buf: String::new(),
             text_gen: u64::MAX,
             text_dirty: false,
+            text_lang_override: None,
             hex_low_nibble: false,
             edit_ascii: false,
             derived_ttl: 0,
@@ -4523,18 +4557,86 @@ impl HexedApp {
             ui.add_space(2.0);
         }
 
+        // Manual language-override picker: auto-detection keys off the extension,
+        // so a decoded `.vbe` saved as `.txt` needs a way to force VBScript.
+        if editable {
+            if let Some(d) = self.docs.get_mut(active) {
+                let detected = if d.text_buf.len() <= HL_LIMIT {
+                    highlight::detect(&d.file_name, &d.text_buf)
+                } else {
+                    highlight::Lang::Plain
+                };
+                ui.horizontal(|ui| {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("Syntax").weak().size(11.0));
+                    let current = d.text_lang_override.unwrap_or(detected);
+                    egui::ComboBox::from_id_salt("text_lang_picker")
+                        .selected_text(highlight::name(current))
+                        .height(360.0) // show every language without scrolling
+                        .show_ui(ui, |ui| {
+                            let auto = format!("Auto · {}", highlight::name(detected));
+                            if ui
+                                .selectable_label(d.text_lang_override.is_none(), auto)
+                                .clicked()
+                            {
+                                d.text_lang_override = None;
+                            }
+                            ui.separator();
+                            for (nm, lang) in highlight::selectable() {
+                                if ui
+                                    .selectable_label(d.text_lang_override == Some(*lang), *nm)
+                                    .clicked()
+                                {
+                                    d.text_lang_override = Some(*lang);
+                                }
+                            }
+                        });
+                    if d.text_lang_override.is_some() {
+                        ui.label(egui::RichText::new("· override").weak().size(10.0));
+                    }
+                });
+                ui.add_space(2.0);
+            }
+        }
+
+        // Syntax colours must be pulled from the palette BEFORE we mutably borrow
+        // self.docs below (the layouter captures them by value).
+        let colors = highlight::SyntaxColors::from(&self.palette);
         let mut changed = false;
         let mut lost_focus = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if let Some(d) = self.docs.get_mut(active) {
+                    // Auto-detect the language (extension, else content sniff) and
+                    // colour via a layouter — but only for real, not-too-large
+                    // UTF-8 text; binaries / huge files render plain.
+                    let lang = if editable && d.text_buf.len() <= HL_LIMIT {
+                        d.text_lang_override
+                            .unwrap_or_else(|| highlight::detect(&d.file_name, &d.text_buf))
+                    } else {
+                        highlight::Lang::Plain
+                    };
+                    let mut layouter = move |ui: &egui::Ui, text: &str, wrap: f32| {
+                        let font_bits = egui::TextStyle::Monospace
+                            .resolve(ui.style())
+                            .size
+                            .to_bits();
+                        let mut job = ui.ctx().memory_mut(|m| {
+                            m.caches
+                                .cache::<HighlightCache>()
+                                .get((colors, text, lang, font_bits))
+                        });
+                        job.wrap.max_width = wrap;
+                        ui.fonts(|f| f.layout_job(job))
+                    };
                     let out = egui::TextEdit::multiline(&mut d.text_buf)
                         .id(egui::Id::new(TEXT_EDIT_ID))
                         .code_editor()
                         .desired_width(f32::INFINITY)
                         .desired_rows(30)
                         .interactive(editable)
+                        .layouter(&mut layouter)
                         .show(ui);
                     changed = out.response.changed();
                     lost_focus = out.response.lost_focus();
