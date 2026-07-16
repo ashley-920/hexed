@@ -78,6 +78,7 @@ Running the built‑in report over the bundled [`examples/demo_triage.bin`](exam
 **Viewing & navigation**
 - Virtualized hex + ASCII grid (opens multi‑hundred‑MB files instantly), byte‑value colour coding, **4 switchable themes**, and a launch splash
 - **Hex / Text view toggle** — flip the central pane between the hex grid and a **text view**, like 010 Editor. Both are **editable**: type hex digits (or ASCII) straight into the grid to overwrite bytes, or edit the file as **word‑wrapped, editable text** — changes commit back to the buffer as one undoable step. Non‑UTF‑8 files stay read‑only in text mode so binaries can't be mangled
+- **Syntax highlighting in the text view** — the text view **auto‑detects the language** (by extension, else a content sniff) and colours it: JavaScript, PowerShell, VBScript, Python, shell, batch, PHP, C‑like, JSON, XML/HTML, and Markdown — handy for reading dropped scripts and configs. Built‑in and dependency‑free
 - **Tabs** — many files at once; each keeps its own selection, strings, hashes, search, and decode state; drag‑and‑drop to open
 - **Entropy strip** down the gutter (blue → red) to spot packed/encrypted regions at a glance
 - **Search** — hex pattern with `??` wildcards or text; **Goto (⌘G)**; click any string, IOC, section, or signature to jump to it
