@@ -4,6 +4,8 @@
 
 use std::collections::HashSet;
 
+use crate::authenticode::{parse_security_directory, PeAuthenticode};
+
 fn u16le(d: &[u8], o: usize) -> Option<u16> {
     d.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
@@ -115,6 +117,9 @@ pub struct PeInfo {
     pub sections: Vec<PeSection>,
     pub imports: Vec<PeImport>,
     pub exports: Vec<PeExport>,
+    /// PE Attribute Certificate Table / Authenticode inventory, when Data
+    /// Directory entry 4 is present. Presence is not a trust-verification claim.
+    pub authenticode: Option<PeAuthenticode>,
 }
 
 impl PeInfo {
@@ -396,6 +401,24 @@ pub fn parse_pe(data: &[u8]) -> Option<PeInfo> {
     let linker_minor = data.get(opt + 3).copied().unwrap_or(0);
     let datadir = if is_64 { opt + 112 } else { opt + 96 };
     let is_dotnet = u32le(data, datadir + 14 * 8).unwrap_or(0) != 0;
+    // Unlike every RVA-based PE data directory, entry 4 contains a FILE OFFSET.
+    // Respect SizeOfOptionalHeader so a short/crafted header cannot make us read
+    // section-table bytes as the certificate-table pointer. Also require the
+    // header to declare at least five data-directory entries.
+    let opt_end = opt.saturating_add(size_opt).min(data.len());
+    let security_entry = datadir.saturating_add(4 * 8);
+    let number_of_rva_and_sizes = u32le(data, datadir.saturating_sub(4)).unwrap_or(0);
+    let authenticode =
+        if number_of_rva_and_sizes >= 5 && security_entry.saturating_add(8) <= opt_end {
+            match (u32le(data, security_entry), u32le(data, security_entry + 4)) {
+                (Some(off), Some(size)) if off != 0 && size != 0 => {
+                    Some(parse_security_directory(data, off as usize, size as usize))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
     let packer = detect_packer(&sections);
     Some(PeInfo {
         is_64,
@@ -411,6 +434,7 @@ pub fn parse_pe(data: &[u8]) -> Option<PeInfo> {
         sections,
         imports,
         exports,
+        authenticode,
     })
 }
 
@@ -820,6 +844,7 @@ mod tests {
             sections: Vec::new(),
             imports,
             exports: Vec::new(),
+            authenticode: None,
         }
     }
 

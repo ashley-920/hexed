@@ -5,6 +5,7 @@
 //! force. Deliberately free of any GUI dependency so the eventual `.bt`
 //! template engine and a headless CLI can build on the same primitives.
 
+pub mod authenticode;
 pub mod buffer;
 pub mod carve;
 pub mod diff;
@@ -23,12 +24,14 @@ pub mod strings;
 pub mod xor;
 pub mod yara;
 
+pub use authenticode::{PeAuthenticode, PeCertificate};
 pub use buffer::Buffer;
 pub use carve::{find_embedded, Embedded};
 pub use diff::{diff_aligned, DiffResult, DiffRun};
 pub use entropy::{entropy_profile, shannon_entropy};
 pub use export::{
-    to_base64, to_c_array, to_hex_string, to_text, to_yara_hex, to_yara_rule, yara_file_magic,
+    to_base64, to_c_array, to_hex_string, to_text, to_yara_hex, to_yara_iocs_rule, to_yara_rule,
+    to_yara_strings_rule, yara_file_magic,
 };
 pub use hashes::{adler32, crc16, crc32, hash_all, md5_hex, sha256_hex, Hashes};
 pub use histogram::{byte_histogram, Histogram};

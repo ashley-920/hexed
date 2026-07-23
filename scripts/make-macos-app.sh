@@ -71,6 +71,11 @@ ${ICON_PLIST}
                  (documents & arbitrary blobs). -->
             <key>LSItemContentTypes</key>
             <array>
+                <!-- Windows PE types must be named explicitly. Although they
+                     conform to public.executable/public.data, Launch Services
+                     refuses an inherited-only document claim for .exe/.dll. -->
+                <string>com.microsoft.windows-executable</string>
+                <string>com.microsoft.windows-dynamic-link-library</string>
                 <string>public.item</string>
                 <string>public.content</string>
                 <string>public.data</string>
@@ -98,6 +103,10 @@ if [[ "${1:-}" == "--install" ]]; then
     echo "==> copying to /Applications"
     rm -rf "/Applications/Hexed.app"
     cp -R "$APP" "/Applications/Hexed.app"
+    LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    if [[ -x "$LSREGISTER" ]]; then
+        "$LSREGISTER" -f "/Applications/Hexed.app"
+    fi
     echo "==> installed: /Applications/Hexed.app"
 fi
 

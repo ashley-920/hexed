@@ -12,9 +12,9 @@ use hexed_core::disasm::disassemble;
 use hexed_core::{
     apply_block_op, brute_force_single_byte, entropy_profile, find_pattern, find_strings,
     find_text, hash_all, inspect, parse_hex_pattern, parse_key, parse_pe, shannon_entropy,
-    to_base64, to_c_array, to_hex_string, to_text, to_yara_hex, to_yara_rule, xor_preview,
-    yara_file_magic, yara_scan, BlockOp, Buffer, Endian, FoundString, Hashes, PeInfo, ScoredKey,
-    StringKind, YaraMatch,
+    to_base64, to_c_array, to_hex_string, to_text, to_yara_hex, to_yara_iocs_rule, to_yara_rule,
+    to_yara_strings_rule, xor_preview, yara_file_magic, yara_scan, BlockOp, Buffer, Endian,
+    FoundString, Hashes, PeInfo, ScoredKey, StringKind, YaraMatch,
 };
 use hexed_core::{
     byte_histogram, defang, diff_aligned, extract_iocs, find_embedded, imphash, md5_hex,
@@ -102,6 +102,27 @@ fn install_fonts(ctx: &egui::Context) {
             .entry(egui::FontFamily::Monospace)
             .or_default()
             .insert(0, "mono".to_owned());
+    }
+    // SF and SF Mono do not contain CJK glyphs. Add a system Chinese font as
+    // fallback so Finder-delivered filenames such as "现场开机.exe" render as
+    // text instead of tofu boxes. Hiragino Sans GB is present on current macOS;
+    // older installations can fall back to STHeiti or Arial Unicode.
+    let cjk = [
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ]
+    .iter()
+    .find_map(|path| std::fs::read(path).ok());
+    if let Some(d) = cjk {
+        fonts
+            .font_data
+            .insert("cjk".to_owned(), Arc::new(egui::FontData::from_owned(d)));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let names = fonts.families.entry(family).or_default();
+            let at = names.len().min(1);
+            names.insert(at, "cjk".to_owned());
+        }
     }
     ctx.set_fonts(fonts);
 }
@@ -242,6 +263,9 @@ struct Document {
     sel_anchor: Option<usize>,
     sel_cursor: Option<usize>,
     strings: Vec<FoundString>,
+    /// Offsets of extracted strings selected for YARA generation. Offsets are
+    /// stable across filtering and are pruned whenever extraction is rebuilt.
+    yara_string_offsets: std::collections::BTreeSet<usize>,
     strings_dirty: bool,
     hashes: Option<(String, Hashes)>,
     xor_key: String,
@@ -290,6 +314,9 @@ struct Document {
     icon_tex: Option<egui::TextureHandle>,
     /// Extracted network/host indicators (cached; recomputed on edit).
     iocs: Vec<Ioc>,
+    /// IOC identities selected for YARA generation. The kind disambiguates
+    /// indicators that begin at the same byte offset.
+    yara_ioc_keys: std::collections::BTreeSet<(usize, IocKind)>,
     /// Embedded files found by magic-signature scan (cached).
     embedded: Vec<Embedded>,
     /// Crypto-constant / packer signature hits (cached).
@@ -336,6 +363,7 @@ impl Document {
             sel_anchor: None,
             sel_cursor: None,
             strings: Vec::new(),
+            yara_string_offsets: std::collections::BTreeSet::new(),
             strings_dirty: true,
             hashes: None,
             xor_key: String::new(),
@@ -363,6 +391,7 @@ impl Document {
             icon_dims: (0, 0),
             icon_tex: None,
             iocs: Vec::new(),
+            yara_ioc_keys: std::collections::BTreeSet::new(),
             embedded: Vec::new(),
             sig_hits: Vec::new(),
             api_flags: Vec::new(),
@@ -391,14 +420,27 @@ impl Document {
     /// Scroll to `off` and select `len` bytes there (used by search, the
     /// strings list, and Goto).
     fn goto(&mut self, off: usize, len: usize) {
+        let data_len = self.buffer.len();
+        if data_len == 0 {
+            self.scroll_to = Some(0);
+            self.scroll_ttl = 4;
+            self.sel_anchor = None;
+            self.sel_cursor = None;
+            self.text_reveal = None;
+            self.text_reveal_ttl = 0;
+            return;
+        }
+        let off = off.min(data_len - 1);
+        let end = off.saturating_add(len.max(1)).min(data_len);
+        let len = end - off;
         self.scroll_to = Some(off);
         self.scroll_ttl = 4;
         self.sel_anchor = Some(off);
-        self.sel_cursor = Some((off + len).saturating_sub(1));
+        self.sel_cursor = Some(end - 1);
         // Mirror the jump into the Text view (consumed by draw_text): scroll to
         // and select the same range, so Find / Goto / click-to-jump land there
         // too, not only in the hex grid.
-        self.text_reveal = Some((off, len.max(1)));
+        self.text_reveal = Some((off, len));
         self.text_reveal_ttl = 4;
     }
 }
@@ -456,6 +498,12 @@ struct HexedApp {
     bookmark_name: String,
     strings_filter: String,
     yara_source: String,
+    /// Whether the editor contains analyst/generated YARA that must be kept
+    /// when a saved template is applied. The untouched scaffold is disposable.
+    yara_has_context: bool,
+    /// Frames remaining to force-open the YARA section and keep its editor in
+    /// view while the collapsing/scroll animations settle.
+    yara_reveal_ttl: u8,
     /// Per-tab scan results: (doc index, file name, matches-or-error).
     yara_result: Option<YaraScanResults>,
     /// Current `.bt` template source (shared editing surface across tabs).
@@ -582,7 +630,7 @@ fn yara_template() -> String {
         r#"rule RENAME_family_or_capability
 {{
     meta:
-        author = "Chi-en (Ashley) Shen"
+        author = "hexed"
         description = "what this rule detects"
         date = "{date}"
         version = "1.0"
@@ -602,6 +650,100 @@ fn yara_template() -> String {
 "#,
         date = today_ymd()
     )
+}
+
+/// Split leading YARA `import`/`include` directives from the rule body. Module
+/// directives must precede every rule, so blindly appending a saved template can
+/// otherwise turn two valid sources into one invalid source.
+fn split_yara_source(source: &str) -> (Vec<String>, String) {
+    let mut directives = Vec::new();
+    let mut body = Vec::new();
+    let mut seen_rule = false;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !seen_rule {
+            seen_rule = yara_rule_name(trimmed).is_some();
+            if !seen_rule && (trimmed.starts_with("import ") || trimmed.starts_with("include ")) {
+                if !directives.iter().any(|d| d == trimmed) {
+                    directives.push(trimmed.to_string());
+                }
+                continue;
+            }
+        }
+        body.push(line);
+    }
+    (directives, body.join("\n").trim().to_string())
+}
+
+fn yara_rule_name(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    if line.starts_with("//") || line.starts_with("/*") {
+        return None;
+    }
+    let mut words = line.split_whitespace();
+    let mut word = words.next()?;
+    loop {
+        if word == "private" || word == "global" {
+            word = words.next()?;
+        } else {
+            break;
+        }
+    }
+    if word != "rule" {
+        return None;
+    }
+    let name = words.next()?.split([':', '{']).next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+fn render_yara_source(directives: &[String], body: &str) -> String {
+    match (directives.is_empty(), body.trim().is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("{}\n", body.trim()),
+        (false, true) => format!("{}\n", directives.join("\n")),
+        (false, false) => format!("{}\n\n{}\n", directives.join("\n"), body.trim()),
+    }
+}
+
+/// Apply a saved YARA template without discarding generated or hand-edited
+/// rules already in the editor. YARA accepts multiple rules in one source, so
+/// retaining each complete rule is safer than splicing its strings or condition.
+fn compose_yara_sources(
+    current: &str,
+    template: &str,
+    preserve_current: bool,
+) -> Result<String, String> {
+    let (mut current_directives, current_body) = split_yara_source(current);
+    let (template_directives, template_body) = split_yara_source(template);
+    if template_body.is_empty() && template_directives.is_empty() {
+        return Ok(render_yara_source(&current_directives, &current_body));
+    }
+    if !preserve_current || current_body.is_empty() {
+        return Ok(render_yara_source(&template_directives, &template_body));
+    }
+    for directive in template_directives {
+        if !current_directives.contains(&directive) {
+            current_directives.push(directive);
+        }
+    }
+    // Re-selecting the same template must not duplicate its rule declaration.
+    if current_body.contains(template_body.trim()) {
+        return Ok(render_yara_source(&current_directives, &current_body));
+    }
+
+    let current_names: std::collections::BTreeSet<&str> =
+        current_body.lines().filter_map(yara_rule_name).collect();
+    if let Some(conflict) = template_body
+        .lines()
+        .filter_map(yara_rule_name)
+        .find(|name| current_names.contains(name))
+    {
+        return Err(format!("rule `{conflict}` already exists in the editor"));
+    }
+
+    let combined_body =
+        format!("{current_body}\n\n// --- applied saved template ---\n{template_body}");
+    Ok(render_yara_source(&current_directives, &combined_body))
 }
 
 /// Strip a leading/trailing Markdown code fence (```lang … ```) so AI-generated
@@ -624,7 +766,7 @@ fn strip_fences(s: &str) -> String {
 
 // Instruction prompts for the canned AI actions.
 const AI_EXPLAIN: &str = "You are a malware reverse-engineering assistant helping a threat analyst. Given the file context and selected bytes, explain what the selection most likely is: its structure, any encoding/encryption, and its purpose. If it looks like x86 code, summarize behavior. Be concise and concrete. You may read the file at the given path and run read-only tools to verify.";
-const AI_YARA: &str = "You are a threat-intel analyst. Based on the file context (you may read the file at the given path), write a robust YARA rule that detects this sample and close variants. Prefer stable strings and code patterns over volatile bytes; add a file-type magic guard in the condition when appropriate. Include a meta block with author \"Chi-en (Ashley) Shen\" and today's date. Output ONLY the rule text — no prose, no Markdown fences.";
+const AI_YARA: &str = "You are a threat-intel analyst. Based on the file context (you may read the file at the given path), write a robust YARA rule that detects this sample and close variants. Prefer stable strings and code patterns over volatile bytes; add a file-type magic guard in the condition when appropriate. Include a meta block with author \"hexed\" and today's date. Output ONLY the rule text — no prose, no Markdown fences.";
 const AI_TRIAGE: &str = "You are a malware triage analyst. Using the file context and PE report below (you may also read the file at the given path), produce a concise triage: likely family/classification, capabilities, notable APIs/behaviors, MITRE ATT&CK technique IDs, and key IOCs. State uncertainty where relevant.";
 const AI_DISASM: &str = "Explain the x86 disassembly in the context below: summarize the behavior in plain language and as short pseudo-C, and note any API calls or notable constructs. Be concise.";
 const AI_BT: &str = "Write a 010 Editor binary template (.bt) that parses this file's format based on the context (you may read the file at the given path). Use struct/typedef, arrays sized by earlier fields, and <bgcolor=...>/<format=...> annotations where helpful. Output ONLY the template code — no prose, no Markdown fences.";
@@ -849,6 +991,8 @@ impl Default for HexedApp {
             bookmark_name: String::new(),
             strings_filter: String::new(),
             yara_source: yara_template(),
+            yara_has_context: false,
+            yara_reveal_ttl: 0,
             yara_result: None,
             bt_source: BUILTIN_TEMPLATES[0].1.to_string(),
             auto_run_template: true,
@@ -1195,11 +1339,18 @@ impl eframe::App for HexedApp {
                     self.strings_ascii,
                     self.strings_utf16,
                 );
+                let valid_offsets: std::collections::BTreeSet<usize> =
+                    d.strings.iter().map(|s| s.offset).collect();
+                d.yara_string_offsets
+                    .retain(|off| valid_offsets.contains(off));
                 d.pe = parse_pe(d.buffer.data());
                 d.entropy_profile = entropy_profile(d.buffer.data(), 512);
                 d.histogram = byte_histogram(d.buffer.data());
                 // Triage scans: IOCs, embedded files, crypto signatures.
                 d.iocs = extract_iocs(d.buffer.data());
+                let valid_ioc_keys: std::collections::BTreeSet<(usize, IocKind)> =
+                    d.iocs.iter().map(|i| (i.offset, i.kind)).collect();
+                d.yara_ioc_keys.retain(|key| valid_ioc_keys.contains(key));
                 d.embedded = find_embedded(d.buffer.data());
                 d.sig_hits = scan_signatures(d.buffer.data());
                 d.api_flags = d.pe.as_ref().map(suspicious_apis).unwrap_or_default();
@@ -1288,7 +1439,18 @@ impl eframe::App for HexedApp {
         let mut goto_query = self.goto_query.clone();
         let mut bookmark_name = self.bookmark_name.clone();
         let mut strings_filter = self.strings_filter.clone();
+        let mut yara_string_offsets = self
+            .docs
+            .get(a)
+            .map(|d| d.yara_string_offsets.clone())
+            .unwrap_or_default();
+        let mut yara_ioc_keys = self
+            .docs
+            .get(a)
+            .map(|d| d.yara_ioc_keys.clone())
+            .unwrap_or_default();
         let mut yara_source = self.yara_source.clone();
+        let mut yara_has_context = self.yara_has_context;
         let mut action_yara_scan = false;
         let mut action_yara_scan_all = false;
         let mut action_yara_export = false;
@@ -1600,6 +1762,8 @@ impl eframe::App for HexedApp {
         let mut remove_bookmark: Option<usize> = None;
         let mut action_upx = false;
         let mut action_pe_report = false;
+        let mut action_yara_from_strings = false;
+        let mut action_yara_from_iocs = false;
         let mut export_file_icon = false;
         // triage-panel actions
         let mut action_triage = false;
@@ -1692,6 +1856,92 @@ impl eframe::App for HexedApp {
                         }
                         ui.monospace(format!("{} · {}", pe.language(), pe.compiler_str()));
                         ui.monospace(format!("compiled: {}", pe.timestamp_str()));
+                        if let Some(auth) = &pe.authenticode {
+                            ui.separator();
+                            if auth.signature_present() {
+                                ui.colored_label(
+                                    self.palette.warn,
+                                    "Authenticode signature present · trust not verified",
+                                );
+                            } else {
+                                ui.colored_label(
+                                    self.palette.warn,
+                                    "PE certificate table present · no PKCS#7 signature parsed",
+                                );
+                            }
+                            ui.monospace(format!(
+                                "certificate table: file 0x{:X} · {} bytes · {} entr{}",
+                                auth.file_offset,
+                                auth.declared_size,
+                                auth.entries,
+                                if auth.entries == 1 { "y" } else { "ies" }
+                            ));
+                            if let Some(signer) = auth.likely_signer() {
+                                let name = signer
+                                    .common_name
+                                    .as_deref()
+                                    .unwrap_or(signer.subject.as_str());
+                                ui.label(
+                                    egui::RichText::new(format!("likely signer: {name}"))
+                                        .color(self.palette.text)
+                                        .strong(),
+                                );
+                            }
+                            if let Some(warning) = &auth.warning {
+                                ui.label(
+                                    egui::RichText::new(format!("parse note: {warning}"))
+                                        .color(self.palette.warn)
+                                        .small(),
+                                );
+                            }
+                            if !auth.certificates.is_empty() {
+                                egui::CollapsingHeader::new(format!(
+                                    "Certificates ({})",
+                                    auth.certificates.len()
+                                ))
+                                .id_salt("authenticode_certificates")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for (i, cert) in auth.certificates.iter().enumerate() {
+                                        let display = cert
+                                            .common_name
+                                            .as_deref()
+                                            .unwrap_or(cert.subject.as_str());
+                                        let role = match (cert.code_signing, cert.is_ca) {
+                                            (true, true) => " · code signing · CA",
+                                            (true, false) => " · code signing",
+                                            (false, true) => " · CA",
+                                            (false, false) => "",
+                                        };
+                                        egui::CollapsingHeader::new(format!(
+                                            "{}. {}{}",
+                                            i + 1,
+                                            display,
+                                            role
+                                        ))
+                                        .id_salt(("authenticode_certificate", i))
+                                        .show(ui, |ui| {
+                                            ui.label("Subject");
+                                            ui.monospace(&cert.subject);
+                                            ui.label("Issuer");
+                                            ui.monospace(&cert.issuer);
+                                            ui.monospace(format!(
+                                                "valid: {} → {}",
+                                                cert.not_before, cert.not_after
+                                            ));
+                                            ui.monospace(format!("serial: {}", cert.serial));
+                                            ui.monospace(format!(
+                                                "signature alg: {} · public key alg: {}",
+                                                cert.signature_algorithm,
+                                                cert.public_key_algorithm
+                                            ));
+                                            ui.label("certificate SHA-256");
+                                            ui.monospace(&cert.sha256);
+                                        });
+                                    }
+                                });
+                            }
+                        }
                         if pe.is_packed() {
                             let txt = match &pe.packer {
                                 Some(p) => format!("PACKED: {p}"),
@@ -1757,6 +2007,15 @@ impl eframe::App for HexedApp {
                             if let Some(ep) = pe.entry_offset() {
                                 if ui.small_button(format!("Entry @ 0x{ep:X}")).clicked() {
                                     jump_to = Some((ep, 1));
+                                }
+                            }
+                            if let Some(auth) = &pe.authenticode {
+                                if ui
+                                    .small_button(format!("Cert @ 0x{:X}", auth.file_offset))
+                                    .clicked()
+                                {
+                                    jump_to =
+                                        Some((auth.file_offset, auth.declared_size.max(1)));
                                 }
                             }
                         });
@@ -2088,6 +2347,28 @@ impl eframe::App for HexedApp {
                                     copy_iocs = Some(ioc_defang);
                                 }
                             });
+                            ui.horizontal_wrapped(|ui| {
+                                let selected = yara_ioc_keys.len();
+                                if ui
+                                    .add_enabled(
+                                        selected > 0,
+                                        egui::Button::new(format!("Create YARA ({selected})")),
+                                    )
+                                    .on_hover_text(
+                                        "build an editable rule from the checked indicators using their original values and encodings",
+                                    )
+                                    .clicked()
+                                {
+                                    action_yara_from_iocs = true;
+                                }
+                                if ui
+                                    .add_enabled(selected > 0, egui::Button::new("Clear"))
+                                    .on_hover_text("clear all checked indicators in this tab")
+                                    .clicked()
+                                {
+                                    yara_ioc_keys.clear();
+                                }
+                            });
                             if let Some(d) = self.docs.get(a) {
                                 for kind in IOC_KINDS {
                                     let group: Vec<&Ioc> =
@@ -2106,22 +2387,44 @@ impl eframe::App for HexedApp {
                                         .size(11.0),
                                     );
                                     for ioc in group.iter().take(300) {
+                                        let key = (ioc.offset, ioc.kind);
                                         let shown = if ioc_defang {
                                             defang(&ioc.value)
                                         } else {
                                             ioc.value.clone()
                                         };
-                                        let resp = ui.add(
-                                            egui::Label::new(egui::RichText::new(&shown).monospace())
+                                        ui.horizontal(|ui| {
+                                            let mut checked = yara_ioc_keys.contains(&key);
+                                            if ui
+                                                .checkbox(&mut checked, "")
+                                                .on_hover_text(
+                                                    "include this indicator in the generated YARA rule",
+                                                )
+                                                .changed()
+                                            {
+                                                if checked {
+                                                    yara_ioc_keys.insert(key);
+                                                } else {
+                                                    yara_ioc_keys.remove(&key);
+                                                }
+                                            }
+                                            let resp = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&shown).monospace(),
+                                                )
                                                 .sense(Sense::click())
                                                 .truncate(),
-                                        );
-                                        if resp
-                                            .on_hover_text(format!("0x{:X} — click to jump", ioc.offset))
-                                            .clicked()
-                                        {
-                                            jump_to = Some((ioc.offset, ioc.byte_len));
-                                        }
+                                            );
+                                            if resp
+                                                .on_hover_text(format!(
+                                                    "0x{:X} — click to jump; YARA uses the original, non-defanged value",
+                                                    ioc.offset
+                                                ))
+                                                .clicked()
+                                            {
+                                                jump_to = Some((ioc.offset, ioc.byte_len));
+                                            }
+                                        });
                                     }
                                 }
                             }
@@ -2199,9 +2502,12 @@ impl eframe::App for HexedApp {
                 } else {
                     "YARA".to_string()
                 };
-                egui::CollapsingHeader::new(yara_header)
+                let reveal_yara = self.yara_reveal_ttl > 0;
+                let mut yara_editor_response: Option<egui::Response> = None;
+                let yara_panel_response = egui::CollapsingHeader::new(yara_header)
                     .id_salt("yara_panel")
                     .default_open(lib_hits > 0)
+                    .open(reveal_yara.then_some(true))
                     .show(ui, |ui| {
                         // ---- rule library: auto-scan results for the active file ----
                         ui.horizontal(|ui| {
@@ -2258,12 +2564,16 @@ impl eframe::App for HexedApp {
                             }
                         }
                         ui.separator();
-                        ui.add(
+                        let response = ui.add(
                             egui::TextEdit::multiline(&mut yara_source)
                                 .code_editor()
                                 .desired_rows(5)
                                 .desired_width(f32::INFINITY),
                         );
+                        if response.changed() {
+                            yara_has_context = true;
+                        }
+                        yara_editor_response = Some(response);
                         ui.horizontal_wrapped(|ui| {
                             if ui
                                 .add_enabled(has_doc, egui::Button::new("Scan buffer"))
@@ -2307,7 +2617,13 @@ impl eframe::App for HexedApp {
                                     ui.separator();
                                     ui.label(egui::RichText::new("saved templates").weak().small());
                                     for (name, path) in &self.yara_templates {
-                                        if ui.button(name).clicked() {
+                                        if ui
+                                            .button(name)
+                                            .on_hover_text(
+                                                "add this saved rule to the current YARA context and immediately scan the active buffer",
+                                            )
+                                            .clicked()
+                                        {
                                             yara_load_template = Some(path.clone());
                                             ui.close_menu();
                                         }
@@ -2356,6 +2672,19 @@ impl eframe::App for HexedApp {
                             }
                         }
                     });
+                if reveal_yara {
+                    if let Some(response) = &yara_editor_response {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                    } else {
+                        yara_panel_response
+                            .header_response
+                            .scroll_to_me(Some(egui::Align::TOP));
+                    }
+                    self.yara_reveal_ttl = self.yara_reveal_ttl.saturating_sub(1);
+                    if self.yara_reveal_ttl > 0 {
+                        ctx.request_repaint();
+                    }
+                }
                 ui.separator();
 
                 // strings
@@ -2388,6 +2717,28 @@ impl eframe::App for HexedApp {
                         strings_filter.clear();
                     }
                 });
+                ui.horizontal_wrapped(|ui| {
+                    let selected = yara_string_offsets.len();
+                    if ui
+                        .add_enabled(
+                            selected > 0,
+                            egui::Button::new(format!("Create YARA ({selected})")),
+                        )
+                        .on_hover_text(
+                            "build an editable rule from the checked strings; ASCII and UTF-16LE encodings are preserved",
+                        )
+                        .clicked()
+                    {
+                        action_yara_from_strings = true;
+                    }
+                    if ui
+                        .add_enabled(selected > 0, egui::Button::new("Clear"))
+                        .on_hover_text("clear all checked strings in this tab")
+                        .clicked()
+                    {
+                        yara_string_offsets.clear();
+                    }
+                });
                 let total = self.docs.get(a).map(|d| d.strings.len()).unwrap_or(0);
                 let filt = strings_filter.to_ascii_lowercase();
                 let mut shown = 0usize;
@@ -2413,14 +2764,28 @@ impl eframe::App for HexedApp {
                                     StringKind::Utf16Le => "W",
                                 };
                                 let line = format!("{:08X} {} {}", s.offset, tag, s.text);
-                                let resp = ui.add(
-                                    egui::Label::new(egui::RichText::new(line).monospace())
-                                        .sense(Sense::click())
-                                        .truncate(),
-                                );
-                                if resp.clicked() {
-                                    jump_to = Some((s.offset, s.len));
-                                }
+                                ui.horizontal(|ui| {
+                                    let mut checked = yara_string_offsets.contains(&s.offset);
+                                    if ui
+                                        .checkbox(&mut checked, "")
+                                        .on_hover_text("include this string in the generated YARA rule")
+                                        .changed()
+                                    {
+                                        if checked {
+                                            yara_string_offsets.insert(s.offset);
+                                        } else {
+                                            yara_string_offsets.remove(&s.offset);
+                                        }
+                                    }
+                                    let resp = ui.add(
+                                        egui::Label::new(egui::RichText::new(line).monospace())
+                                            .sense(Sense::click())
+                                            .truncate(),
+                                    );
+                                    if resp.clicked() {
+                                        jump_to = Some((s.offset, s.len));
+                                    }
+                                });
                             }
                         }
                     });
@@ -3233,7 +3598,12 @@ impl eframe::App for HexedApp {
         self.replace_query = replace_query.clone();
         self.bookmark_name = bookmark_name;
         self.strings_filter = strings_filter;
+        if let Some(d) = self.docs.get_mut(a) {
+            d.yara_string_offsets = yara_string_offsets;
+            d.yara_ioc_keys = yara_ioc_keys;
+        }
         self.yara_source = yara_source;
+        self.yara_has_context = yara_has_context;
         self.disasm_bits = disasm_bits;
         self.bytes_per_row = bytes_per_row;
         if view_mode != self.view {
@@ -4169,6 +4539,7 @@ impl eframe::App for HexedApp {
                 self.status = match std::fs::read_to_string(&path) {
                     Ok(s) => {
                         self.yara_source = s;
+                        self.yara_has_context = true;
                         format!("Imported rule from {}", abbrev_home(&path))
                     }
                     Err(e) => format!("Import failed: {e}"),
@@ -4177,6 +4548,7 @@ impl eframe::App for HexedApp {
         }
         if action_yara_new {
             self.yara_source = yara_template();
+            self.yara_has_context = false;
             self.status = "Inserted a new YARA template".to_string();
         }
         if action_yara_save_template {
@@ -4236,12 +4608,97 @@ impl eframe::App for HexedApp {
         }
         if let Some(path) = yara_load_template {
             self.status = match std::fs::read_to_string(&path) {
-                Ok(s) => {
-                    self.yara_source = s;
-                    format!("Loaded template {}", abbrev_home(&path))
-                }
+                Ok(s) => match compose_yara_sources(&self.yara_source, &s, self.yara_has_context) {
+                    Ok(combined) => {
+                        let preserved = self.yara_has_context;
+                        let changed = combined.trim() != self.yara_source.trim();
+                        self.yara_source = combined;
+                        self.yara_has_context = true;
+                        self.yara_reveal_ttl = 4;
+                        if let Some(d) = self.docs.get(a) {
+                            let result = yara_scan(&self.yara_source, d.buffer.data());
+                            let matches = result.as_ref().map(|m| m.len()).unwrap_or(0);
+                            self.yara_result = Some(vec![(a, d.file_name.clone(), result)]);
+                            if !changed {
+                                format!(
+                                    "Template {} is already in the current YARA context — {matches} match(es)",
+                                    abbrev_home(&path)
+                                )
+                            } else if preserved {
+                                format!(
+                                    "Applied template {} with the current YARA context — {matches} match(es)",
+                                    abbrev_home(&path)
+                                )
+                            } else {
+                                format!(
+                                    "Loaded and applied template {} — {matches} match(es)",
+                                    abbrev_home(&path)
+                                )
+                            }
+                        } else {
+                            format!("Loaded template {}", abbrev_home(&path))
+                        }
+                    }
+                    Err(e) => format!("Template not applied: {e}"),
+                },
                 Err(e) => format!("Load failed: {e}"),
             };
+        }
+        if action_yara_from_strings {
+            let rule = self.docs.get(a).and_then(|d| {
+                let selected: Vec<FoundString> = d
+                    .strings
+                    .iter()
+                    .filter(|s| d.yara_string_offsets.contains(&s.offset))
+                    .cloned()
+                    .collect();
+                if selected.is_empty() {
+                    return None;
+                }
+                let magic = yara_file_magic(d.buffer.data());
+                let today = today_ymd();
+                Some(to_yara_strings_rule(
+                    &selected,
+                    "hexed_strings",
+                    Some("hexed"),
+                    Some(&today),
+                    magic,
+                ))
+            });
+            if let Some(rule) = rule {
+                self.yara_source = rule;
+                self.yara_has_context = true;
+                self.yara_reveal_ttl = 4;
+                self.status = "YARA rule generated from selected strings".to_string();
+            }
+        }
+        if action_yara_from_iocs {
+            let rule = self.docs.get(a).and_then(|d| {
+                let selected: Vec<Ioc> = d
+                    .iocs
+                    .iter()
+                    .filter(|ioc| d.yara_ioc_keys.contains(&(ioc.offset, ioc.kind)))
+                    .cloned()
+                    .collect();
+                if selected.is_empty() {
+                    return None;
+                }
+                let magic = yara_file_magic(d.buffer.data());
+                let today = today_ymd();
+                Some(to_yara_iocs_rule(
+                    &selected,
+                    "hexed_iocs",
+                    Some("hexed"),
+                    Some(&today),
+                    magic,
+                ))
+            });
+            if let Some(rule) = rule {
+                self.yara_source = rule;
+                self.yara_has_context = true;
+                self.yara_reveal_ttl = 4;
+                self.status = "YARA rule generated from selected IOCs".to_string();
+            }
         }
         if action_yara_from_sel {
             let rule = sel.and_then(|(s, e)| {
@@ -4253,7 +4710,7 @@ impl eframe::App for HexedApp {
                     to_yara_rule(
                         d.buffer.slice(s, cap),
                         "hexed_sel",
-                        Some("Chi-en (Ashley) Shen"),
+                        Some("hexed"),
                         Some(&today),
                         magic,
                     )
@@ -4261,8 +4718,9 @@ impl eframe::App for HexedApp {
             });
             if let Some(r) = rule {
                 self.yara_source = r;
-                self.status =
-                    "YARA rule generated from selection — open the YARA panel to scan".to_string();
+                self.yara_has_context = true;
+                self.yara_reveal_ttl = 4;
+                self.status = "YARA rule generated from selection".to_string();
             }
         }
         if action_close {
@@ -4429,7 +4887,9 @@ impl HexedApp {
                 let rule = strip_fences(&self.ai.output);
                 if !rule.trim().is_empty() {
                     self.yara_source = rule;
-                    self.status = "AI generated a YARA rule (in the YARA panel)".to_string();
+                    self.yara_has_context = true;
+                    self.yara_reveal_ttl = 4;
+                    self.status = "AI generated a YARA rule".to_string();
                 }
             }
             Some(AiAction::Bt) => {
@@ -5206,6 +5666,44 @@ fn build_pe_report(file_name: &str, data: &[u8], pe: &PeInfo) -> String {
         .map(|o| format!(" (file 0x{o:X})"))
         .unwrap_or_default();
     let _ = writeln!(s, "entry: RVA 0x{:X}{}", pe.entry_rva, entry);
+    if let Some(auth) = &pe.authenticode {
+        let status = if auth.signature_present() {
+            "signature present (trust not verified)"
+        } else {
+            "certificate table present; no PKCS#7 signature parsed"
+        };
+        let _ = writeln!(
+            s,
+            "Authenticode: {status}; table file 0x{:X}, {} bytes, {} entries",
+            auth.file_offset, auth.declared_size, auth.entries
+        );
+        if let Some(signer) = auth.likely_signer() {
+            let _ = writeln!(
+                s,
+                "likely signer: {}",
+                signer
+                    .common_name
+                    .as_deref()
+                    .unwrap_or(signer.subject.as_str())
+            );
+        }
+        if let Some(warning) = &auth.warning {
+            let _ = writeln!(s, "certificate parse note: {warning}");
+        }
+        for (i, cert) in auth.certificates.iter().enumerate() {
+            let _ = writeln!(s, "  Certificate {}:", i + 1);
+            let _ = writeln!(s, "    subject: {}", cert.subject);
+            let _ = writeln!(s, "    issuer: {}", cert.issuer);
+            let _ = writeln!(s, "    serial: {}", cert.serial);
+            let _ = writeln!(s, "    valid: {} -> {}", cert.not_before, cert.not_after);
+            let _ = writeln!(
+                s,
+                "    algorithms: signature {} | public key {}",
+                cert.signature_algorithm, cert.public_key_algorithm
+            );
+            let _ = writeln!(s, "    certificate SHA256: {}", cert.sha256);
+        }
+    }
     if pe.is_packed() {
         let _ = writeln!(
             s,
@@ -5311,6 +5809,38 @@ fn build_triage_report(d: &Document, vt: Option<&vt::VtVerdict>) -> String {
             pe.compiler_str()
         );
         let _ = writeln!(s, "- compiled: {}", pe.timestamp_str());
+        if let Some(auth) = &pe.authenticode {
+            let status = if auth.signature_present() {
+                "signature present (trust not verified)"
+            } else {
+                "certificate table present; no PKCS#7 signature parsed"
+            };
+            let _ = writeln!(
+                s,
+                "- Authenticode: {status}; table `0x{:X}`, {} bytes",
+                auth.file_offset, auth.declared_size
+            );
+            if let Some(signer) = auth.likely_signer() {
+                let _ = writeln!(
+                    s,
+                    "- likely signer: `{}`",
+                    signer
+                        .common_name
+                        .as_deref()
+                        .unwrap_or(signer.subject.as_str())
+                );
+            }
+            for cert in &auth.certificates {
+                let _ = writeln!(
+                    s,
+                    "  - certificate `{}`; issuer `{}`; valid {} → {}; SHA-256 `{}`",
+                    cert.subject, cert.issuer, cert.not_before, cert.not_after, cert.sha256
+                );
+            }
+            if let Some(warning) = &auth.warning {
+                let _ = writeln!(s, "- certificate parse note: {warning}");
+            }
+        }
         if pe.is_packed() {
             let _ = writeln!(
                 s,
@@ -5526,4 +6056,97 @@ fn hash_row(ui: &mut egui::Ui, name: &str, value: &str) {
         ui.ctx().copy_text(value.to_string());
     }
     ui.end_row();
+}
+
+#[cfg(test)]
+mod yara_composition_tests {
+    use super::{compose_yara_sources, yara_template, Document};
+
+    const GENERATED: &str = r#"
+rule selected_ioc_context {
+    strings:
+        $ioc = "evil.example" ascii
+    condition:
+        $ioc
+}
+"#;
+
+    const SAVED_TEMPLATE: &str = r#"
+rule process_injection_template {
+    strings:
+        $api = "VirtualAllocEx" ascii
+    condition:
+        $api
+}
+"#;
+
+    #[test]
+    fn template_preserves_current_rules_and_combined_source_matches() {
+        let combined =
+            compose_yara_sources(GENERATED, SAVED_TEMPLATE, true).expect("sources should compose");
+        assert!(combined.contains("rule selected_ioc_context"));
+        assert!(combined.contains("rule process_injection_template"));
+
+        let matches = hexed_core::yara_scan(&combined, b"MZ evil.example VirtualAllocEx")
+            .expect("combined YARA should compile");
+        let mut names: Vec<&str> = matches.iter().map(|m| m.rule.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["process_injection_template", "selected_ioc_context"]
+        );
+    }
+
+    #[test]
+    fn template_application_is_idempotent_and_replaces_untouched_scaffold() {
+        let once =
+            compose_yara_sources(GENERATED, SAVED_TEMPLATE, true).expect("sources should compose");
+        let twice = compose_yara_sources(&once, SAVED_TEMPLATE, true)
+            .expect("reapplying should be accepted");
+        assert_eq!(twice, once);
+
+        let replaced = compose_yara_sources(&yara_template(), SAVED_TEMPLATE, false)
+            .expect("scaffold should be replaceable");
+        assert!(!replaced.contains("RENAME_family_or_capability"));
+        assert!(replaced.contains("rule process_injection_template"));
+    }
+
+    #[test]
+    fn template_imports_are_hoisted_and_rule_name_conflicts_are_rejected() {
+        let with_import = r#"
+import "pe"
+
+rule pe_template {
+    condition:
+        pe.is_pe
+}
+"#;
+        let combined =
+            compose_yara_sources(GENERATED, with_import, true).expect("sources should compose");
+        assert!(combined.starts_with("import \"pe\"\n\nrule selected_ioc_context"));
+        hexed_core::yara_scan(&combined, b"MZ evil.example")
+            .expect("combined source with a module import should compile");
+
+        let conflict = compose_yara_sources(GENERATED, GENERATED, true)
+            .expect("an identical rule should be idempotent");
+        assert_eq!(conflict.trim(), GENERATED.trim());
+
+        let edited_conflict = GENERATED.replace("evil.example", "changed.example");
+        let err = compose_yara_sources(GENERATED, &edited_conflict, true)
+            .expect_err("different rules with the same name must not be combined");
+        assert!(err.contains("selected_ioc_context"));
+    }
+
+    #[test]
+    fn goto_clamps_hostile_ranges_to_the_buffer() {
+        let mut doc = Document::new(hexed_core::Buffer::from_bytes(vec![1, 2, 3]), "x".into());
+        doc.goto(usize::MAX, usize::MAX);
+        assert_eq!(doc.selection_range(), Some((2, 3)));
+        assert_eq!(doc.text_reveal, Some((2, 1)));
+
+        let mut empty = Document::new(hexed_core::Buffer::from_bytes(Vec::new()), "empty".into());
+        empty.goto(usize::MAX, usize::MAX);
+        assert_eq!(empty.selection_range(), None);
+        assert_eq!(empty.text_reveal, None);
+    }
 }

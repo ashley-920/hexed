@@ -18,13 +18,14 @@ The triage panels light up the moment a file loads — no config, no scripting.
 
 | Capability | What you get |
 |---|---|
-| **IOC extraction** | URLs, domains, IPv4, emails, Windows/Unix paths, registry keys, and BTC/ETH wallets — pulled from ASCII **and** UTF‑16 strings, de‑duplicated, each **click‑to‑jump** to its offset. One‑click **defang** (`hxxp://`, `1[.]2[.]3[.]4`) and **copy‑all**. |
+| **IOC extraction** | URLs, domains, IPv4, emails, Windows/Unix paths, registry keys, and BTC/ETH wallets — pulled from ASCII **and** UTF‑16 strings, de‑duplicated, each **click‑to‑jump** to its offset. One‑click **defang** (`hxxp://`, `1[.]2[.]3[.]4`) and **copy‑all**; check multiple indicators to generate an encoding-correct YARA rule. |
 | **Suspicious API flagging** | Imported Win32 APIs grouped by capability — **Injection** (`VirtualAllocEx`, `WriteProcessMemory`, `CreateRemoteThread`), **Persistence**, **Anti‑analysis** (`IsDebuggerPresent`), **Networking** (`connect`/`recv`/`bind` → possible backdoor), **Crypto** (ransomware tells), and more. |
+| **Authenticode inventory** | Detects the PE certificate table and inventories embedded PKCS#7/X.509 certificates: likely signer, subject, issuer, validity, algorithms, serial, and certificate SHA‑256. Clearly labels that cryptographic trust, revocation, and file-digest verification are **not** performed. |
 | **Embedded‑file carving** | Scans for hidden payloads by magic — appended/resource **PE**, **ZIP/GZIP/7z/RAR**, **PNG/JPEG/PDF**, **ELF/Mach‑O** — `MZ` validated through to `PE\0\0`. Click to jump, or **extract to a new tab**. |
 | **Crypto & packer signatures** | Detects **AES S‑box**, SHA‑256/MD5/SHA‑1 constants, CRC‑32 tables, base64 alphabets, and **UPX** markers — often the fastest route to the decryptor. |
 | **imphash + section hashes** | pefile‑compatible **imphash** for pivoting on VirusTotal, plus per‑section MD5 and entropy. |
 | **One‑click triage report** | A full Markdown report — hashes, imphash, entropy, PE summary, flagged APIs, IOCs, embedded files, signatures (plus the VirusTotal verdict when enrichment is on) — copied to your clipboard, ready to paste into a ticket or blog. |
-| **YARA rule library** | Keep a folder of your YARA rules; every file you open is **auto‑scanned against all of them** and matches surface immediately, each **click‑to‑jump** to the matched bytes. Save a generated rule straight into the library. |
+| **YARA rule library** | Keep a folder of your YARA rules; every file you open is **auto‑scanned against all of them** and matches surface immediately, each **click‑to‑jump** to the matched bytes. Generate rules from multiple strings or IOCs, then apply saved templates without discarding the current editor context. |
 | **VirusTotal** *(opt‑in)* | Toggle **by‑hash** enrichment: looks up the file's SHA‑256 to show detection ratio + family label — **never uploads** the sample. Also pivots on the PE's **icon** (`main_icon_dhash`) to tell you how many files share it (unique lure vs. common family), and an "Open in VT" button. Off by default (a hash lookup still tells VT). |
 | **AI assist** *(optional)* | Bridges to the `codex` CLI to explain a selection, draft a YARA rule, identify a cipher and decode it, or produce an ATT&CK‑mapped triage write‑up. |
 
@@ -91,14 +92,14 @@ Running the built‑in report over the bundled [`examples/demo_triage.bin`](exam
 
 **Structure & analysis**
 - **Data inspector** — int/uint 8–64, float32/64, `time_t`, Windows `FILETIME`, LE/BE, multi‑base converter
-- **PE navigator** — sections with offsets, RWX perms, per‑section entropy (>7.0 flagged), imports/exports, and **embedded‑icon extraction**
+- **PE navigator** — sections with offsets, RWX perms, per‑section entropy (>7.0 flagged), imports/exports, **Authenticode certificate inventory**, and **embedded‑icon extraction**
 - **`.bt` binary templates** — a 010‑style template engine with a colour‑coded result tree and click‑to‑jump nodes
 - **Strings** (ASCII + UTF‑16), **byte histogram**, **x86 disassembly**, **binary diff/compare**, **bookmarks**
 - **Hashes** — CRC‑32 / MD5 / SHA‑1 / SHA‑256 of selection or file
 
 **Export / carving**
 - Copy selection as Hex, Text, **YARA hex** (`{ 6A ?? 40 }`), C array, or base64 (right‑click → "Copy As")
-- **YARA** — generate a rule from a sample, scan the buffer, and keep a **rule library** that auto-scans every file you open (matches show up with click-to-jump to the matched bytes)
+- **YARA** — generate a rule from selected bytes, multiple strings, or multiple IOCs; apply saved templates while preserving edited rules; scan the buffer; and keep a **rule library** that auto-scans every file you open
 - Carve any selection — or a detected embedded file — into a new tab or to disk
 
 ---
@@ -128,7 +129,7 @@ cargo test                                    # run the test suite
 ```sh
 ./scripts/make-macos-app.sh --install
 ```
-Builds a release binary, bundles **Hexed.app**, ad‑hoc code‑signs it (so Gatekeeper lets it run), and copies it to `/Applications`. It then appears in Spotlight/Launchpad, and you can **right‑click any file in Finder → Open With → Hexed** — it registers as an *alternate* handler (`LSHandlerRank=Alternate`), so it never becomes a default or changes your file associations. Omit `--install` to just build the bundle under `target/release/`.
+Builds a release binary, bundles **Hexed.app**, ad‑hoc code‑signs it (so Gatekeeper lets it run), and copies it to `/Applications`. It then appears in Spotlight/Launchpad, and you can **right‑click any file in Finder → Open With → Hexed**, including Windows `.exe` and `.dll` files — it registers as an *alternate* handler (`LSHandlerRank=Alternate`), so it never becomes a default or changes your file associations. Omit `--install` to just build the bundle under `target/release/`.
 
 ### Configuration *(optional)*
 - **VirusTotal** — put your VT API key in `~/.hexed_vt_key` (or set `$VT_API_KEY`), then toggle **Enrichment** on in the VirusTotal panel. Lookups are by‑hash only and off by default; the key stays local and is never committed.

@@ -47,6 +47,33 @@ fn main() {
 
     if let Some(pe) = parse_pe(&data) {
         println!("\nimphash: {}", imphash(&pe));
+        if let Some(auth) = &pe.authenticode {
+            println!(
+                "Authenticode: {} ({} table entries, {} embedded certificates; trust not verified)",
+                if auth.signature_present() {
+                    "signature present"
+                } else {
+                    "certificate table only"
+                },
+                auth.entries,
+                auth.certificates.len()
+            );
+            if let Some(signer) = auth.likely_signer() {
+                println!(
+                    "  likely signer: {}",
+                    signer
+                        .common_name
+                        .as_deref()
+                        .unwrap_or(signer.subject.as_str())
+                );
+                println!("  issuer: {}", signer.issuer);
+                println!("  valid: {} -> {}", signer.not_before, signer.not_after);
+                println!("  certificate SHA256: {}", signer.sha256);
+            }
+            if let Some(warning) = &auth.warning {
+                println!("  parse note: {warning}");
+            }
+        }
         let flags = suspicious_apis(&pe);
         println!("flagged APIs ({}):", flags.len());
         for f in flags.iter().take(20) {

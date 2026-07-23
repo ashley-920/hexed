@@ -3,6 +3,9 @@
 
 use std::fmt::Write;
 
+use crate::ioc::Ioc;
+use crate::strings::{FoundString, StringKind};
+
 /// Space-separated uppercase hex, e.g. `"6A 40 1F"`.
 pub fn to_hex_string(data: &[u8]) -> String {
     let mut s = String::with_capacity(data.len() * 3);
@@ -75,6 +78,135 @@ pub fn to_yara_rule(
         }
         None => {
             let _ = writeln!(s, "        $a");
+        }
+    }
+    let _ = writeln!(s, "}}");
+    s
+}
+
+/// Escape one extracted printable string for a YARA quoted text literal.
+fn yara_text_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:02X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A complete YARA rule built from analyst-selected extracted strings. ASCII
+/// and UTF-16LE strings retain their encoding through explicit `ascii`/`wide`
+/// modifiers. The condition requires every selected string and optionally
+/// anchors the rule to the detected file magic.
+pub fn to_yara_strings_rule(
+    strings: &[FoundString],
+    name: &str,
+    author: Option<&str>,
+    date: Option<&str>,
+    magic: Option<&str>,
+) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "rule {name}");
+    let _ = writeln!(s, "{{");
+    if let Some(a) = author {
+        let _ = writeln!(s, "    meta:");
+        let _ = writeln!(s, "        author = \"{a}\"");
+        let _ = writeln!(
+            s,
+            "        description = \"auto-generated from selected strings\""
+        );
+        let _ = writeln!(s, "        date = \"{}\"", date.unwrap_or("YYYY-MM-DD"));
+    }
+    let _ = writeln!(s, "    strings:");
+    for (i, found) in strings.iter().enumerate() {
+        let modifier = match found.kind {
+            StringKind::Ascii => "ascii",
+            StringKind::Utf16Le => "wide",
+        };
+        let _ = writeln!(
+            s,
+            "        $s{} = \"{}\" {}",
+            i + 1,
+            yara_text_literal(&found.text),
+            modifier
+        );
+    }
+    let _ = writeln!(s, "    condition:");
+    let selected = if strings.is_empty() {
+        "false"
+    } else {
+        "all of ($s*)"
+    };
+    match magic {
+        Some(m) => {
+            let _ = writeln!(s, "        {m} and {selected}");
+        }
+        None => {
+            let _ = writeln!(s, "        {selected}");
+        }
+    }
+    let _ = writeln!(s, "}}");
+    s
+}
+
+/// A complete YARA rule built from analyst-selected indicators. IOC values are
+/// emitted in their original (never defanged) form and retain the ASCII or
+/// UTF-16LE encoding of the bytes from which they were extracted.
+pub fn to_yara_iocs_rule(
+    iocs: &[Ioc],
+    name: &str,
+    author: Option<&str>,
+    date: Option<&str>,
+    magic: Option<&str>,
+) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "rule {name}");
+    let _ = writeln!(s, "{{");
+    if let Some(a) = author {
+        let _ = writeln!(s, "    meta:");
+        let _ = writeln!(s, "        author = \"{a}\"");
+        let _ = writeln!(
+            s,
+            "        description = \"auto-generated from selected IOCs\""
+        );
+        let _ = writeln!(s, "        date = \"{}\"", date.unwrap_or("YYYY-MM-DD"));
+    }
+    let _ = writeln!(s, "    strings:");
+    for (i, ioc) in iocs.iter().enumerate() {
+        let modifier = match ioc.encoding {
+            StringKind::Ascii => "ascii",
+            StringKind::Utf16Le => "wide",
+        };
+        let _ = writeln!(
+            s,
+            "        $ioc{} = \"{}\" {} // {}",
+            i + 1,
+            yara_text_literal(&ioc.value),
+            modifier,
+            ioc.kind.label()
+        );
+    }
+    let _ = writeln!(s, "    condition:");
+    let selected = if iocs.is_empty() {
+        "false"
+    } else {
+        "all of ($ioc*)"
+    };
+    match magic {
+        Some(m) => {
+            let _ = writeln!(s, "        {m} and {selected}");
+        }
+        None => {
+            let _ = writeln!(s, "        {selected}");
         }
     }
     let _ = writeln!(s, "}}");
@@ -176,6 +308,108 @@ mod tests_yara {
         let plain = to_yara_rule(&[0x90], "r", None, None, None);
         assert!(plain.contains("condition:\n        $a\n"));
         assert!(!plain.contains("meta:"));
+    }
+
+    #[test]
+    fn selected_strings_keep_encoding_and_escape_literals() {
+        let strings = vec![
+            FoundString {
+                offset: 0x20,
+                len: 9,
+                kind: StringKind::Ascii,
+                text: "say \"hi\"\\".into(),
+            },
+            FoundString {
+                offset: 0x80,
+                len: 14,
+                kind: StringKind::Utf16Le,
+                text: "payload".into(),
+            },
+        ];
+        let rule = to_yara_strings_rule(
+            &strings,
+            "selected",
+            Some("hexed"),
+            Some("2026-07-23"),
+            Some("uint16be(0) == 0x4D5A"),
+        );
+        assert!(rule.contains("$s1 = \"say \\\"hi\\\"\\\\\" ascii"));
+        assert!(rule.contains("$s2 = \"payload\" wide"));
+        assert!(rule.contains("uint16be(0) == 0x4D5A and all of ($s*)"));
+    }
+
+    #[test]
+    fn empty_selected_strings_rule_never_matches() {
+        let rule = to_yara_strings_rule(&[], "empty", None, None, None);
+        assert!(rule.contains("condition:\n        false\n"));
+    }
+
+    #[test]
+    fn selected_ascii_and_wide_rule_compiles_and_matches() {
+        let strings = vec![
+            FoundString {
+                offset: 2,
+                len: 5,
+                kind: StringKind::Ascii,
+                text: "alpha".into(),
+            },
+            FoundString {
+                offset: 8,
+                len: 8,
+                kind: StringKind::Utf16Le,
+                text: "beta".into(),
+            },
+        ];
+        let rule = to_yara_strings_rule(
+            &strings,
+            "selected_encodings",
+            Some("hexed"),
+            Some("2026-07-23"),
+            yara_file_magic(b"MZ"),
+        );
+        let mut sample = b"MZalpha\0".to_vec();
+        sample.extend_from_slice(b"b\0e\0t\0a\0");
+        let matches = crate::yara::yara_scan(&rule, &sample).expect("rule should compile");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].rule, "selected_encodings");
+    }
+
+    #[test]
+    fn selected_iocs_keep_original_values_and_compile() {
+        let iocs = vec![
+            Ioc {
+                kind: crate::ioc::IocKind::Url,
+                value: "https://evil.example/drop".into(),
+                encoding: StringKind::Ascii,
+                offset: 2,
+                byte_len: 25,
+            },
+            Ioc {
+                kind: crate::ioc::IocKind::WinPath,
+                value: r"C:\Temp\drop.exe".into(),
+                encoding: StringKind::Utf16Le,
+                offset: 32,
+                byte_len: 32,
+            },
+        ];
+        let rule = to_yara_iocs_rule(
+            &iocs,
+            "selected_iocs",
+            Some("hexed"),
+            Some("2026-07-23"),
+            yara_file_magic(b"MZ"),
+        );
+        assert!(rule.contains(r#"$ioc1 = "https://evil.example/drop" ascii // URL"#));
+        assert!(rule.contains(r#"$ioc2 = "C:\\Temp\\drop.exe" wide // Windows path"#));
+        assert!(!rule.contains("hxxp"));
+
+        let mut sample = b"MZhttps://evil.example/drop\0".to_vec();
+        for byte in br"C:\Temp\drop.exe" {
+            sample.extend_from_slice(&[*byte, 0]);
+        }
+        let matches = crate::yara::yara_scan(&rule, &sample).expect("rule should compile");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].rule, "selected_iocs");
     }
 }
 

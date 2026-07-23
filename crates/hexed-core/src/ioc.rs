@@ -9,7 +9,9 @@
 
 use std::collections::HashSet;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+use crate::strings::StringKind;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum IocKind {
     Ipv4,
     Url,
@@ -40,6 +42,9 @@ impl IocKind {
 pub struct Ioc {
     pub kind: IocKind,
     pub value: String,
+    /// Encoding of the printable string that contained this occurrence. This
+    /// lets downstream detection generation match the bytes actually present.
+    pub encoding: StringKind,
     /// Byte offset of the first occurrence within the scanned buffer.
     pub offset: usize,
     /// Span in buffer bytes (2× the char count for UTF-16LE sources), so the UI
@@ -68,6 +73,7 @@ pub fn extract_iocs(data: &[u8]) -> Vec<Ioc> {
                 out.push(Ioc {
                     kind,
                     byte_len,
+                    encoding: s.kind,
                     offset: base + idx * stride,
                     value,
                 });
@@ -684,6 +690,19 @@ mod tests {
         let iocs = extract_iocs(data);
         let ip = iocs.iter().find(|i| i.kind == IocKind::Ipv4).unwrap();
         assert_eq!(ip.offset, 2);
+        assert_eq!(ip.encoding, StringKind::Ascii);
+    }
+
+    #[test]
+    fn utf16_ioc_retains_source_encoding() {
+        let mut data = Vec::new();
+        for byte in b"https://evil.example/drop" {
+            data.extend_from_slice(&[*byte, 0]);
+        }
+        let iocs = extract_iocs(&data);
+        let url = iocs.iter().find(|i| i.kind == IocKind::Url).unwrap();
+        assert_eq!(url.encoding, StringKind::Utf16Le);
+        assert_eq!(url.byte_len, url.value.len() * 2);
     }
 
     #[test]
