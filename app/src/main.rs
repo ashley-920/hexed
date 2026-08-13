@@ -477,6 +477,11 @@ type YaraScanResults = Vec<(usize, String, Result<Vec<YaraMatch>, String>)>;
 struct HexedApp {
     docs: Vec<Document>,
     active: usize,
+    /// How many untitled documents this session has created, so File > New can
+    /// number them (`Untitled-1`, `Untitled-2`, …). Never decremented: closing
+    /// `Untitled-2` must not make the next new tab reuse that name while the
+    /// original is still open elsewhere.
+    untitled_seq: u32,
     /// The `active` index seen on the previous frame; when it changes we drop the
     /// hex grid's keyboard focus so a keystroke can't land on a doc the user
     /// never clicked into (see the focus reset in `update`).
@@ -848,6 +853,15 @@ fn save_bookmarks(map: &BookmarkStore) {
     }
 }
 
+/// Tab name for the `n`th unsaved document of this session.
+///
+/// Hyphenated so it never collides with a real file the user also has open: an
+/// `Untitled-1` tab is unambiguously the blank one, and Save As replaces the
+/// name with the chosen file's.
+fn untitled_name(n: u32) -> String {
+    format!("Untitled-{n}")
+}
+
 /// Shorten a path for display by replacing the home dir with `~`.
 fn abbrev_home(p: &std::path::Path) -> String {
     let s = p.to_string_lossy();
@@ -978,6 +992,7 @@ impl Default for HexedApp {
         Self {
             docs: Vec::new(),
             active: 0,
+            untitled_seq: 0,
             last_active: 0,
             grid_focus_stale: false,
             copy_flash_id: "",
@@ -1008,7 +1023,7 @@ impl Default for HexedApp {
             xor_key_history: load_xor_keys(),
             recent: load_recent(),
             bookmarks_store: load_bookmarks(),
-            status: "Open a file (Ctrl+O) or drop one onto the window to begin.".to_string(),
+            status: "Open a file (Ctrl+O), start a new one (Ctrl+N), or drop a file onto the window to begin.".to_string(),
             ai: Ai::default(),
             ai_available: Ai::available(),
             show_about: false,
@@ -1024,6 +1039,20 @@ impl Default for HexedApp {
 impl HexedApp {
     fn active_doc(&self) -> Option<&Document> {
         self.docs.get(self.active)
+    }
+
+    /// Open a blank, unsaved document in a new tab (010's File > New Hex File).
+    ///
+    /// The buffer starts empty and pathless, so it is not dirty until edited and
+    /// Save routes to Save As. Fill it by typing in the Text view, or from the
+    /// Hex view via Edit / resize > Insert 00.
+    fn new_doc(&mut self) {
+        self.untitled_seq = self.untitled_seq.saturating_add(1);
+        let name = untitled_name(self.untitled_seq);
+        self.docs
+            .push(Document::new(Buffer::from_bytes(Vec::new()), name.clone()));
+        self.active = self.docs.len() - 1;
+        self.status = format!("New file {name} — empty, unsaved");
     }
 
     fn open_path(&mut self, path: std::path::PathBuf) {
@@ -1222,6 +1251,7 @@ impl eframe::App for HexedApp {
         let flash_pe = flash("pe_report");
 
         // ---- keyboard shortcuts ----
+        let mut action_new = false;
         let mut action_open = false;
         let mut action_open_recent: Option<std::path::PathBuf> = None;
         let mut action_save = false;
@@ -1243,6 +1273,9 @@ impl eframe::App for HexedApp {
         });
         ctx.input(|i| {
             if i.modifiers.command {
+                if i.key_pressed(egui::Key::N) {
+                    action_new = true;
+                }
                 if i.key_pressed(egui::Key::O) {
                     action_open = true;
                 }
@@ -1386,12 +1419,14 @@ impl eframe::App for HexedApp {
             self.rescan_yara_active(a);
             // Only look a file up on VirusTotal when it is unmodified. Editing a
             // byte changes the hash to one VT can't know, so a lookup would just
-            // burn quota and leak that we're mutating the sample.
+            // burn quota and leak that we're mutating the sample. A blank File >
+            // New document is skipped for the same reason: the empty-file hash
+            // tells us nothing about anything the user actually has.
             if self.vt.enabled {
                 let sha = self
                     .docs
                     .get(a)
-                    .filter(|d| !d.buffer.is_dirty())
+                    .filter(|d| !d.buffer.is_dirty() && !d.buffer.is_empty())
                     .map(|d| d.file_sha256.clone());
                 if let Some(sha) = sha {
                     self.vt.request(&sha);
@@ -1404,6 +1439,8 @@ impl eframe::App for HexedApp {
         }
 
         let sel = self.active_doc().and_then(|d| d.selection_range());
+        // A blank File > New document: no bytes yet, so no caret to insert at.
+        let doc_is_empty = self.active_doc().is_some_and(|d| d.buffer.is_empty());
         let cur = self.active_doc().and_then(|d| d.sel_cursor);
         let sel_entropy = sel.and_then(|(s, e)| {
             self.docs.get(a).map(|d| {
@@ -1485,6 +1522,13 @@ impl eframe::App for HexedApp {
         // ---- top menu bar ----
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
+                if ui
+                    .button("New")
+                    .on_hover_text("open a blank, unsaved document in a new tab  (⌘N)")
+                    .clicked()
+                {
+                    action_new = true;
+                }
                 ui.menu_button("Open", |ui| {
                     if ui.button("Open file…  (⌘O)").clicked() {
                         action_open = true;
@@ -3271,14 +3315,16 @@ impl eframe::App for HexedApp {
                                     .range(1..=1_048_576)
                                     .prefix("n="),
                             );
+                            // An empty document has no caret to click, so allow
+                            // the first insert at offset 0 — otherwise a new file
+                            // could never be given bytes from the Hex view.
+                            let can_insert = cur.is_some() || doc_is_empty;
                             if ui
-                                .add_enabled(cur.is_some(), egui::Button::new("Insert 00"))
+                                .add_enabled(can_insert, egui::Button::new("Insert 00"))
                                 .on_hover_text("insert n zero bytes at the caret (undoable)")
                                 .clicked()
                             {
-                                if let Some(c) = cur {
-                                    action_insert = Some((c, insert_count));
-                                }
+                                action_insert = Some((cur.unwrap_or(0), insert_count));
                             }
                             if ui
                                 .add_enabled(sel.is_some(), egui::Button::new("Delete sel"))
@@ -4212,6 +4258,9 @@ impl eframe::App for HexedApp {
                 d.xor_key = k;
             }
         }
+        if action_new {
+            self.new_doc();
+        }
         if action_open {
             if let Some(path) = rfd::FileDialog::new().pick_file() {
                 self.open_path(path);
@@ -4222,15 +4271,22 @@ impl eframe::App for HexedApp {
         }
         if action_save {
             self.commit_text(a); // flush any pending text-view edits first
-            let mut st = None;
-            if let Some(d) = self.docs.get_mut(a) {
-                st = Some(match d.buffer.save() {
-                    Ok(()) => "Saved.".to_string(),
-                    Err(e) => format!("Save failed: {e}"),
-                });
-            }
-            if let Some(s) = st {
-                self.status = s;
+                                 // A new (untitled) document has nowhere to save to yet, so ⌘S has to
+                                 // become Save As rather than fail. The Save As block runs later in
+                                 // this same frame, so handing off is just setting its flag.
+            if self.docs.get(a).is_some_and(|d| d.buffer.path().is_none()) {
+                action_save_as = true;
+            } else {
+                let mut st = None;
+                if let Some(d) = self.docs.get_mut(a) {
+                    st = Some(match d.buffer.save() {
+                        Ok(()) => "Saved.".to_string(),
+                        Err(e) => format!("Save failed: {e}"),
+                    });
+                }
+                if let Some(s) = st {
+                    self.status = s;
+                }
             }
         }
         if let Some((off, bytes)) = action_apply_xor {
@@ -4343,8 +4399,14 @@ impl eframe::App for HexedApp {
         }
         if action_save_as {
             self.commit_text(a); // flush any pending text-view edits first
-            if let Some(path) = rfd::FileDialog::new().save_file() {
+            let suggested = self.docs.get(a).map(|d| d.file_name.clone());
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(name) = suggested {
+                dialog = dialog.set_file_name(name);
+            }
+            if let Some(path) = dialog.save_file() {
                 let mut st = None;
+                let mut saved = false;
                 if let Some(d) = self.docs.get_mut(a) {
                     match d.buffer.save_as(&path) {
                         Ok(()) => {
@@ -4353,9 +4415,15 @@ impl eframe::App for HexedApp {
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_default();
                             st = Some(format!("Saved as {}", d.file_name));
+                            saved = true;
                         }
                         Err(e) => st = Some(format!("Save As failed: {e}")),
                     }
+                }
+                // The document now has a path, so it belongs in Recent like any
+                // opened file — this is how a just-created file gets reopenable.
+                if saved {
+                    self.push_recent(path);
                 }
                 if let Some(s) = st {
                     self.status = s;
@@ -4979,16 +5047,15 @@ impl HexedApp {
         let (len, editable) = match self.docs.get(active) {
             None => {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Open a file (Ctrl+O) or drop one onto the window.");
+                    ui.label("Open a file (Ctrl+O), start a new one (Ctrl+N), or drop a file onto the window.");
                 });
                 return (None, None);
             }
             Some(d) => (d.buffer.len(), std::str::from_utf8(d.buffer.data()).is_ok()),
         };
-        if len == 0 {
-            ui.label("(empty file)");
-            return (None, None);
-        }
+        // An empty buffer is valid UTF-8, so it falls through to the editor
+        // below rather than dead-ending on a placeholder — that is the point of
+        // File > New: a blank tab you can immediately type into.
         if len > EDIT_LIMIT {
             ui.label(
                 egui::RichText::new(format!(
@@ -5183,14 +5250,26 @@ impl HexedApp {
         let active = self.active;
         let Some(doc) = self.docs.get(active) else {
             ui.centered_and_justified(|ui| {
-                ui.label("Open a file (Ctrl+O) or drop one onto the window.");
+                ui.label("Open a file (Ctrl+O), start a new one (Ctrl+N), or drop a file onto the window.");
             });
             return (None, None);
         };
         let data = doc.buffer.data();
         let len = data.len();
+        // The grid below indexes `len - 1` for the edit caret, so zero bytes has
+        // to stop here. Say how to get bytes in rather than just naming the state.
         if len == 0 {
-            ui.label("(empty file)");
+            ui.vertical(|ui| {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Empty file — 0 bytes").weak());
+                ui.label(
+                    egui::RichText::new(
+                        "Type in the Text view, or add bytes here with Edit / resize > Insert 00.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+            });
             return (None, None);
         }
         // Edit-caret state snapshotted for this frame (byte-editing, 010-style).
@@ -6056,6 +6135,42 @@ fn hash_row(ui: &mut egui::Ui, name: &str, value: &str) {
         ui.ctx().copy_text(value.to_string());
     }
     ui.end_row();
+}
+
+#[cfg(test)]
+mod new_document_tests {
+    use super::{untitled_name, Buffer, Document};
+
+    #[test]
+    fn untitled_names_are_numbered_and_unique() {
+        assert_eq!(untitled_name(1), "Untitled-1");
+        assert_eq!(untitled_name(2), "Untitled-2");
+        // The sequence never repeats within a session, so two blank tabs are
+        // always tellable apart in the tab bar.
+        let names: std::collections::HashSet<String> = (1..=64).map(untitled_name).collect();
+        assert_eq!(names.len(), 64);
+    }
+
+    #[test]
+    fn a_new_document_is_blank_unsaved_and_not_dirty() {
+        let d = Document::new(Buffer::from_bytes(Vec::new()), untitled_name(1));
+        assert_eq!(d.file_name, "Untitled-1");
+        assert!(d.buffer.is_empty());
+        // No path is precisely what makes ⌘S hand off to Save As.
+        assert!(d.buffer.path().is_none());
+        // Nothing typed yet, so the tab must not show the unsaved-changes dot.
+        assert!(!d.buffer.is_dirty());
+        assert!(!d.text_dirty);
+    }
+
+    #[test]
+    fn a_new_document_reports_dirty_once_edited() {
+        let mut d = Document::new(Buffer::from_bytes(Vec::new()), untitled_name(3));
+        d.buffer.insert(0, b"MZ");
+        assert!(d.buffer.is_dirty());
+        assert_eq!(d.buffer.data(), b"MZ");
+        assert!(d.buffer.path().is_none(), "editing must not invent a path");
+    }
 }
 
 #[cfg(test)]

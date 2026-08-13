@@ -356,6 +356,73 @@ mod tests {
         assert!(!b.undo());
     }
 
+    /// A unique scratch path per test, so a parallel run can't collide.
+    fn tmp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("hexed_buffer_test_{}_{}", std::process::id(), tag))
+    }
+
+    #[test]
+    fn blank_buffer_is_pathless_clean_and_empty() {
+        // What File > New hands the UI. `path == None` is what makes Save fall
+        // back to Save As, and `!dirty` is what keeps a brand-new tab from
+        // claiming unsaved changes before it has been touched.
+        let b = Buffer::from_bytes(Vec::new());
+        assert!(b.is_empty());
+        assert_eq!(b.len(), 0);
+        assert!(b.path().is_none());
+        assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn save_without_a_path_is_an_error_not_a_silent_no_op() {
+        let mut b = Buffer::from_bytes(b"abc".to_vec());
+        let err = b.save().expect_err("a pathless buffer must refuse to save");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(b.path().is_none());
+    }
+
+    #[test]
+    fn typing_into_a_blank_buffer_grows_it_and_is_undoable() {
+        // The path a new document takes when the user types in the Text view:
+        // commit_text -> replace_all on an initially empty buffer.
+        let mut b = Buffer::from_bytes(Vec::new());
+        b.replace_all(b"hello".to_vec());
+        assert_eq!(b.data(), b"hello");
+        assert!(b.is_dirty());
+        assert!(b.undo());
+        assert!(b.is_empty(), "undo must return it to blank");
+    }
+
+    #[test]
+    fn insert_into_a_blank_buffer_at_zero_works() {
+        // The Hex-view path for a new document: Insert 00 at offset 0, which is
+        // the one offset an empty buffer accepts.
+        let mut b = Buffer::from_bytes(Vec::new());
+        b.insert(0, &[0u8; 4]);
+        assert_eq!(b.data(), &[0, 0, 0, 0]);
+        assert!(b.undo());
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn save_as_sets_the_path_then_save_reuses_it() {
+        let p = tmp_path("save_as");
+        let _ = std::fs::remove_file(&p);
+        let mut b = Buffer::from_bytes(Vec::new());
+        b.replace_all(b"first".to_vec());
+        b.save_as(&p).expect("save_as writes and adopts the path");
+        assert_eq!(b.path(), Some(p.as_path()));
+        assert!(!b.is_dirty(), "save_as must clear dirty");
+        assert_eq!(std::fs::read(&p).unwrap(), b"first");
+
+        // Now that it has a path, a plain save must write to that same file.
+        b.replace_all(b"second".to_vec());
+        b.save().expect("save now has a path");
+        assert_eq!(std::fs::read(&p).unwrap(), b"second");
+        assert!(!b.is_dirty());
+        let _ = std::fs::remove_file(&p);
+    }
+
     #[test]
     fn slice_is_clamped() {
         let b = Buffer::from_bytes(vec![1, 2, 3]);
