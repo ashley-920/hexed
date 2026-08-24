@@ -56,6 +56,12 @@ type HighlightCache = egui::util::cache::FrameCache<egui::text::LayoutJob, Highl
 /// Only syntax-highlight text up to this size; larger files render plain so the
 /// per-frame key hash / tokenization can't cost anything noticeable.
 const HL_LIMIT: usize = 512 * 1024;
+
+/// Largest file the Text view will render. Past this the wrapping galley layout
+/// costs more per frame than the view is worth, so it defers to the Hex view
+/// (which is virtualized and stays cheap at any size). Opening is *not* limited
+/// — the whole file is loaded and analyzed regardless of this.
+const TEXT_VIEW_LIMIT: usize = 1024 * 1024;
 use ai::Ai;
 use theme::{Palette, Theme};
 use vt::Vt;
@@ -588,6 +594,42 @@ fn save_view(v: ViewMode) {
     }
 }
 
+/// Format a byte count for display: `1 byte`, `900 bytes`, `1.5 KB`, `4.0 MB`.
+/// Binary units (1 KB = 1024 bytes), matching how the size limits here are written.
+fn human_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if bytes == 1 {
+        "1 byte".to_string()
+    } else if b < KB {
+        format!("{bytes} bytes")
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.1} GB", b / GB)
+    }
+}
+
+/// The notice shown in place of the Text view for a file past [`TEXT_VIEW_LIMIT`].
+///
+/// Names the limit rather than only the file's size. Quoting the size alone
+/// ("File is 3.2 MB — too large") reads as if the cutoff were wherever that
+/// particular file happened to land, so every reader infers a different limit.
+/// It also says the file *did* load, because an otherwise-blank pane reads as a
+/// failed open.
+fn text_view_too_large_msg(len: usize) -> String {
+    format!(
+        "The text view is limited to {}; this file is {}. \
+         It is fully loaded — switch to the Hex view to read it.",
+        human_size(TEXT_VIEW_LIMIT),
+        human_size(len)
+    )
+}
+
 /// A canned AI action triggered from the panel.
 #[derive(Clone, Copy)]
 enum AiAction {
@@ -1033,7 +1075,25 @@ impl HexedApp {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.status = format!("Opened {} ({} bytes)", name, buf.len());
+                let len = buf.len();
+                // A file past the Text view's limit would render as nothing but a
+                // greyed-out notice, which reads as "it failed to open" even though
+                // it loaded and analyzed fine. Drop to Hex so the bytes are there.
+                // Deliberately not persisted via `save_view`: this is an
+                // accommodation for one file, not a change of preference.
+                let fell_back = len > TEXT_VIEW_LIMIT && self.view == ViewMode::Text;
+                if fell_back {
+                    self.view = ViewMode::Hex;
+                }
+                self.status = if fell_back {
+                    format!(
+                        "Opened {} ({}) — too large for the Text view, showing Hex",
+                        name,
+                        human_size(len)
+                    )
+                } else {
+                    format!("Opened {} ({} bytes)", name, len)
+                };
                 self.docs.push(Document::new(buf, name));
                 self.active = self.docs.len() - 1;
                 if let Some(bms) = self.bookmarks_store.get(&path) {
@@ -4974,7 +5034,6 @@ impl HexedApp {
     /// undoable change when the field loses focus (or on save). Binary
     /// (non-UTF-8) or large files are read-only to avoid corruption / lag.
     fn draw_text(&mut self, ui: &mut egui::Ui) -> (Option<SelUpdate>, Option<(usize, Vec<u8>)>) {
-        const EDIT_LIMIT: usize = 1024 * 1024;
         let active = self.active;
         let (len, editable) = match self.docs.get(active) {
             None => {
@@ -4989,14 +5048,8 @@ impl HexedApp {
             ui.label("(empty file)");
             return (None, None);
         }
-        if len > EDIT_LIMIT {
-            ui.label(
-                egui::RichText::new(format!(
-                    "File is {:.1} MB — too large for the text view; use the Hex view.",
-                    len as f64 / (1024.0 * 1024.0)
-                ))
-                .weak(),
-            );
+        if len > TEXT_VIEW_LIMIT {
+            ui.label(egui::RichText::new(text_view_too_large_msg(len)).weak());
             return (None, None);
         }
         // Rebuild the text buffer from bytes when the buffer changed under us
@@ -6148,5 +6201,74 @@ rule pe_template {
         empty.goto(usize::MAX, usize::MAX);
         assert_eq!(empty.selection_range(), None);
         assert_eq!(empty.text_reveal, None);
+    }
+}
+
+#[cfg(test)]
+mod human_size_tests {
+    use super::{human_size, TEXT_VIEW_LIMIT};
+
+    #[test]
+    fn singular_and_plural_bytes() {
+        assert_eq!(human_size(0), "0 bytes");
+        assert_eq!(human_size(1), "1 byte");
+        assert_eq!(human_size(2), "2 bytes");
+        assert_eq!(human_size(1023), "1023 bytes");
+    }
+
+    #[test]
+    fn unit_boundaries_step_exactly_at_1024() {
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1024 * 1024 - 1), "1024.0 KB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    /// The whole point of the message: it must name the limit, and the limit
+    /// must read as a round "1.0 MB" rather than something like "1048576 bytes".
+    #[test]
+    fn the_text_view_limit_renders_as_a_round_figure() {
+        assert_eq!(human_size(TEXT_VIEW_LIMIT), "1.0 MB");
+    }
+
+    #[test]
+    fn large_and_extreme_values_do_not_panic() {
+        assert_eq!(human_size(4 * 1024 * 1024), "4.0 MB");
+        assert_eq!(human_size(20 * 1024 * 1024), "20.0 MB");
+        // usize::MAX must format, not overflow or panic.
+        let s = human_size(usize::MAX);
+        assert!(s.ends_with(" GB"), "unexpected unit: {s}");
+    }
+}
+
+#[cfg(test)]
+mod text_view_notice_tests {
+    use super::{text_view_too_large_msg, TEXT_VIEW_LIMIT};
+
+    /// The regression this whole change exists for: the notice must name the
+    /// actual limit. Quoting only the file's size is what made a 3.2 MB file
+    /// look like proof of a "3 MB ceiling".
+    #[test]
+    fn names_the_limit_not_just_the_file_size() {
+        let msg = text_view_too_large_msg(4 * 1024 * 1024);
+        assert!(msg.contains("1.0 MB"), "must state the limit: {msg}");
+        assert!(msg.contains("4.0 MB"), "must state the file size: {msg}");
+    }
+
+    /// A blank-looking pane reads as a failed open, so the notice has to say
+    /// the file loaded and point at the view that can show it.
+    #[test]
+    fn says_the_file_loaded_and_where_to_read_it() {
+        let msg = text_view_too_large_msg(20 * 1024 * 1024);
+        assert!(msg.contains("fully loaded"), "{msg}");
+        assert!(msg.contains("Hex view"), "{msg}");
+    }
+
+    /// The limit in the text is derived from the const, so the two cannot drift
+    /// apart the way the old hardcoded phrasing could.
+    #[test]
+    fn limit_in_text_tracks_the_const() {
+        let msg = text_view_too_large_msg(TEXT_VIEW_LIMIT + 1);
+        assert!(msg.contains(&super::human_size(TEXT_VIEW_LIMIT)), "{msg}");
     }
 }
