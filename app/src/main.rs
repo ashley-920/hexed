@@ -17,9 +17,9 @@ use hexed_core::{
     FoundString, Hashes, PeInfo, ScoredKey, StringKind, YaraMatch,
 };
 use hexed_core::{
-    byte_histogram, defang, diff_aligned, extract_iocs, find_embedded, imphash, md5_hex,
-    scan_signatures, sha256_hex, suspicious_apis, ApiFlag, Embedded, Histogram, Ioc, IocKind,
-    SigHit,
+    byte_histogram, defang, diff_aligned, extract_iocs, find_embedded, imphash, ioc_matches,
+    md5_hex, scan_signatures, sha256_hex, suspicious_apis, ApiFlag, Embedded, Histogram, Ioc,
+    IocKind, SigHit,
 };
 
 mod ai;
@@ -73,6 +73,13 @@ const IOC_KINDS: &[IocKind] = &[
     IocKind::Registry,
     IocKind::Wallet,
 ];
+
+/// Whether an indicator survives the IOCs panel's kind toggles and search box.
+/// The panel header count and the rendered rows share this one predicate so the
+/// "shown / total" tally can never disagree with what is actually listed.
+fn ioc_visible(ioc: &Ioc, query: &str, hidden_kinds: &std::collections::BTreeSet<IocKind>) -> bool {
+    !hidden_kinds.contains(&ioc.kind) && ioc_matches(&ioc.value, query)
+}
 
 /// The app icon, embedded so it's available for the window icon, the About box,
 /// and export-to-PNG.
@@ -497,6 +504,10 @@ struct HexedApp {
     replace_query: String,
     bookmark_name: String,
     strings_filter: String,
+    /// Search box for the IOCs panel; matches raw and defanged renderings.
+    ioc_filter: String,
+    /// IOC kinds toggled off in the IOCs panel. Empty means every kind shows.
+    ioc_kinds_hidden: std::collections::BTreeSet<IocKind>,
     yara_source: String,
     /// Whether the editor contains analyst/generated YARA that must be kept
     /// when a saved template is applied. The untouched scaffold is disposable.
@@ -990,6 +1001,8 @@ impl Default for HexedApp {
             replace_query: String::new(),
             bookmark_name: String::new(),
             strings_filter: String::new(),
+            ioc_filter: String::new(),
+            ioc_kinds_hidden: std::collections::BTreeSet::new(),
             yara_source: yara_template(),
             yara_has_context: false,
             yara_reveal_ttl: 0,
@@ -1439,6 +1452,8 @@ impl eframe::App for HexedApp {
         let mut goto_query = self.goto_query.clone();
         let mut bookmark_name = self.bookmark_name.clone();
         let mut strings_filter = self.strings_filter.clone();
+        let mut ioc_filter = self.ioc_filter.clone();
+        let mut ioc_kinds_hidden = self.ioc_kinds_hidden.clone();
         let mut yara_string_offsets = self
             .docs
             .get(a)
@@ -2332,7 +2347,23 @@ impl eframe::App for HexedApp {
 
                 // IOCs — extracted network / host indicators
                 let ioc_count = self.docs.get(a).map(|d| d.iocs.len()).unwrap_or(0);
-                egui::CollapsingHeader::new(format!("IOCs ({ioc_count})"))
+                let ioc_shown = self
+                    .docs
+                    .get(a)
+                    .map(|d| {
+                        d.iocs
+                            .iter()
+                            .filter(|i| ioc_visible(i, &ioc_filter, &ioc_kinds_hidden))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let ioc_filtered = ioc_shown != ioc_count;
+                let ioc_header = if ioc_filtered {
+                    format!("IOCs ({ioc_shown} / {ioc_count})")
+                } else {
+                    format!("IOCs ({ioc_count})")
+                };
+                egui::CollapsingHeader::new(ioc_header)
                     .id_salt("iocs_panel")
                     .default_open(ioc_count > 0)
                     .show(ui, |ui| {
@@ -2342,9 +2373,56 @@ impl eframe::App for HexedApp {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut ioc_defang, "defang")
                                     .on_hover_text("render safe (hxxp://, 1[.]2[.]3[.]4)");
-                                let ioc_label = if flash_iocs { "Copied!" } else { "Copy all" };
-                                if ui.button(ioc_label).clicked() {
+                                let ioc_label = if flash_iocs {
+                                    "Copied!"
+                                } else if ioc_filtered {
+                                    "Copy shown"
+                                } else {
+                                    "Copy all"
+                                };
+                                if ui
+                                    .button(ioc_label)
+                                    .on_hover_text(if ioc_filtered {
+                                        "copy only the indicators matching the filter below"
+                                    } else {
+                                        "copy every extracted indicator"
+                                    })
+                                    .clicked()
+                                {
                                     copy_iocs = Some(ioc_defang);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("filter:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut ioc_filter)
+                                        .desired_width(170.0)
+                                        .hint_text("substring"),
+                                );
+                                if !ioc_filter.is_empty() && ui.small_button("×").clicked() {
+                                    ioc_filter.clear();
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if let Some(d) = self.docs.get(a) {
+                                    for kind in IOC_KINDS {
+                                        let n = d.iocs.iter().filter(|i| i.kind == *kind).count();
+                                        if n == 0 {
+                                            continue;
+                                        }
+                                        let on = !ioc_kinds_hidden.contains(kind);
+                                        if ui
+                                            .selectable_label(on, format!("{} {n}", kind.label()))
+                                            .on_hover_text("show or hide this indicator kind")
+                                            .clicked()
+                                        {
+                                            if on {
+                                                ioc_kinds_hidden.insert(*kind);
+                                            } else {
+                                                ioc_kinds_hidden.remove(kind);
+                                            }
+                                        }
+                                    }
                                 }
                             });
                             ui.horizontal_wrapped(|ui| {
@@ -2370,12 +2448,20 @@ impl eframe::App for HexedApp {
                                 }
                             });
                             if let Some(d) = self.docs.get(a) {
+                                let mut any_shown = false;
                                 for kind in IOC_KINDS {
-                                    let group: Vec<&Ioc> =
-                                        d.iocs.iter().filter(|i| i.kind == *kind).collect();
+                                    let group: Vec<&Ioc> = d
+                                        .iocs
+                                        .iter()
+                                        .filter(|i| {
+                                            i.kind == *kind
+                                                && ioc_visible(i, &ioc_filter, &ioc_kinds_hidden)
+                                        })
+                                        .collect();
                                     if group.is_empty() {
                                         continue;
                                     }
+                                    any_shown = true;
                                     ui.add_space(2.0);
                                     ui.label(
                                         egui::RichText::new(format!(
@@ -2426,6 +2512,9 @@ impl eframe::App for HexedApp {
                                             }
                                         });
                                     }
+                                }
+                                if !any_shown {
+                                    ui.weak("No indicators match the filter.");
                                 }
                             }
                         }
@@ -3598,6 +3687,8 @@ impl eframe::App for HexedApp {
         self.replace_query = replace_query.clone();
         self.bookmark_name = bookmark_name;
         self.strings_filter = strings_filter;
+        self.ioc_filter = ioc_filter;
+        self.ioc_kinds_hidden = ioc_kinds_hidden;
         if let Some(d) = self.docs.get_mut(a) {
             d.yara_string_offsets = yara_string_offsets;
             d.yara_ioc_keys = yara_ioc_keys;
@@ -4151,12 +4242,22 @@ impl eframe::App for HexedApp {
             }
         }
 
-        // ---- copy all IOCs to the clipboard ----
+        // ---- copy the IOCs currently listed in the panel to the clipboard ----
+        // Honours the panel's search box and kind toggles, so what lands on the
+        // clipboard is what the analyst can see — the button relabels to
+        // "Copy shown" whenever a filter is narrowing the list.
         if let Some(defanged) = copy_iocs {
             if let Some(d) = self.docs.get(a) {
                 let mut s = String::new();
                 for kind in IOC_KINDS {
-                    let group: Vec<&Ioc> = d.iocs.iter().filter(|i| i.kind == *kind).collect();
+                    let group: Vec<&Ioc> = d
+                        .iocs
+                        .iter()
+                        .filter(|i| {
+                            i.kind == *kind
+                                && ioc_visible(i, &self.ioc_filter, &self.ioc_kinds_hidden)
+                        })
+                        .collect();
                     if group.is_empty() {
                         continue;
                     }
@@ -6148,5 +6249,87 @@ rule pe_template {
         empty.goto(usize::MAX, usize::MAX);
         assert_eq!(empty.selection_range(), None);
         assert_eq!(empty.text_reveal, None);
+    }
+}
+
+#[cfg(test)]
+mod ioc_filter_tests {
+    use super::{ioc_visible, Ioc, IocKind, StringKind, IOC_KINDS};
+
+    fn ioc(kind: IocKind, value: &str) -> Ioc {
+        Ioc {
+            kind,
+            value: value.to_string(),
+            encoding: StringKind::Ascii,
+            offset: 0,
+            byte_len: value.len(),
+        }
+    }
+
+    fn hidden(kinds: &[IocKind]) -> std::collections::BTreeSet<IocKind> {
+        kinds.iter().copied().collect()
+    }
+
+    #[test]
+    fn no_filter_shows_every_kind() {
+        let none = hidden(&[]);
+        for kind in IOC_KINDS {
+            assert!(ioc_visible(&ioc(*kind, "evil.example.com"), "", &none));
+        }
+    }
+
+    #[test]
+    fn hidden_kind_is_excluded_whatever_the_query() {
+        let h = hidden(&[IocKind::Domain]);
+        assert!(!ioc_visible(
+            &ioc(IocKind::Domain, "evil.example.com"),
+            "",
+            &h
+        ));
+        assert!(!ioc_visible(
+            &ioc(IocKind::Domain, "evil.example.com"),
+            "evil",
+            &h
+        ));
+        // The same text under a kind that is still on remains visible.
+        assert!(ioc_visible(
+            &ioc(IocKind::Url, "http://evil.example.com"),
+            "evil",
+            &h
+        ));
+    }
+
+    #[test]
+    fn query_and_kind_filters_compose() {
+        let h = hidden(&[IocKind::Ipv4]);
+        assert!(ioc_visible(
+            &ioc(IocKind::Url, "http://evil.example.com"),
+            "evil",
+            &h
+        ));
+        assert!(!ioc_visible(
+            &ioc(IocKind::Url, "http://good.example.com"),
+            "evil",
+            &h
+        ));
+        assert!(!ioc_visible(&ioc(IocKind::Ipv4, "1.2.3.4"), "1.2", &h));
+    }
+
+    #[test]
+    fn hiding_every_kind_hides_everything() {
+        let h = hidden(IOC_KINDS);
+        for kind in IOC_KINDS {
+            assert!(!ioc_visible(&ioc(*kind, "evil.example.com"), "", &h));
+        }
+    }
+
+    #[test]
+    fn defanged_query_reaches_the_live_value_through_the_panel_predicate() {
+        let none = hidden(&[]);
+        assert!(ioc_visible(
+            &ioc(IocKind::Domain, "evil.example.com"),
+            "evil[.]example",
+            &none
+        ));
     }
 }

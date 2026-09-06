@@ -96,6 +96,28 @@ pub fn defang(s: &str) -> String {
     out.replace('.', "[.]")
 }
 
+/// Case-insensitive substring test backing the IOC panel's search box. Matches
+/// the raw value and its defanged rendering alike, so a query pasted straight
+/// out of a report (`evil[.]com`, `hxxps://`) still finds the live indicator it
+/// was written from. An empty or whitespace-only query matches everything.
+pub fn ioc_matches(value: &str, query: &str) -> bool {
+    // Bail out before allocating: with no filter typed this runs over every
+    // indicator, several times per frame, so the idle path must not allocate.
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    let q = q.to_ascii_lowercase();
+    let v = value.to_ascii_lowercase();
+    if v.contains(&q) {
+        return true;
+    }
+    // Only pay for building the defanged form when the query actually looks
+    // defanged; the common case is a plain substring over every indicator on
+    // every frame, so it must stay allocation-light.
+    (q.contains("[.]") || q.contains("hxxp")) && defang(&v).contains(&q)
+}
+
 fn scan(t: &[u8], push: &mut impl FnMut(IocKind, String, usize)) {
     scan_urls(t, push);
     scan_emails(t, push);
@@ -709,5 +731,45 @@ mod tests {
     fn defang_neutralizes() {
         assert_eq!(defang("http://evil.com"), "hxxp://evil[.]com");
         assert_eq!(defang("1.2.3.4"), "1[.]2[.]3[.]4");
+    }
+
+    #[test]
+    fn empty_query_matches_everything() {
+        assert!(ioc_matches("evil.com", ""));
+        assert!(ioc_matches("evil.com", "   "));
+        assert!(ioc_matches("", ""));
+    }
+
+    #[test]
+    fn matches_are_case_insensitive_substrings() {
+        assert!(ioc_matches("http://EVIL.example.com/x", "evil"));
+        assert!(ioc_matches("evil.example.com", "EXAMPLE"));
+        assert!(ioc_matches("C:\\Windows\\System32\\evil.dll", "system32"));
+        assert!(!ioc_matches("evil.example.com", "goodware"));
+    }
+
+    #[test]
+    fn defanged_query_finds_the_live_value() {
+        // An analyst pasting an indicator back out of a report should still
+        // land on the original.
+        assert!(ioc_matches("evil.com", "evil[.]com"));
+        assert!(ioc_matches("1.2.3.4", "1[.]2[.]3[.]4"));
+        assert!(ioc_matches("http://evil.com/beacon", "hxxp://evil[.]com"));
+        assert!(ioc_matches("https://evil.com", "hxxps://"));
+    }
+
+    #[test]
+    fn defanged_query_still_has_to_match() {
+        assert!(!ioc_matches("good.com", "evil[.]com"));
+        assert!(!ioc_matches("1.2.3.4", "9[.]9[.]9[.]9"));
+    }
+
+    #[test]
+    fn partial_and_boundary_queries_behave() {
+        // Substring semantics, not token or prefix matching.
+        assert!(ioc_matches("evil.example.com", ".example."));
+        assert!(ioc_matches("185.220.101.7", "220.101"));
+        // A query longer than the value can never match.
+        assert!(!ioc_matches("a.com", "aaaaaaaaaaa.com"));
     }
 }
