@@ -256,11 +256,13 @@ enum CopyKind {
 }
 
 /// How the central pane renders the file: the hex+ASCII grid or a text view.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewMode {
     Hex,
     Text,
 }
+
+const DEFAULT_VIEW_MODE: ViewMode = ViewMode::Hex;
 
 /// All state tied to one open file (one tab).
 struct Document {
@@ -572,28 +574,6 @@ fn save_theme(t: Theme) {
     }
 }
 
-/// Remember the central-pane view mode across launches (`~/.hexed_view.txt`).
-fn load_view() -> ViewMode {
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".hexed_view.txt"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| {
-            if s.trim() == "text" {
-                ViewMode::Text
-            } else {
-                ViewMode::Hex
-            }
-        })
-        .unwrap_or(ViewMode::Hex)
-}
-
-fn save_view(v: ViewMode) {
-    if let Some(h) = std::env::var_os("HOME") {
-        let p = std::path::PathBuf::from(h).join(".hexed_view.txt");
-        let _ = std::fs::write(p, if v == ViewMode::Text { "text" } else { "hex" });
-    }
-}
-
 /// Format a byte count for display: `1 byte`, `900 bytes`, `1.5 KB`, `4.0 MB`.
 /// Binary units (1 KB = 1024 bytes), matching how the size limits here are written.
 fn human_size(bytes: usize) -> String {
@@ -626,6 +606,21 @@ fn text_view_too_large_msg(len: usize) -> String {
         "The text view is limited to {}; this file is {}. \
          It is fully loaded — switch to the Hex view to read it.",
         human_size(TEXT_VIEW_LIMIT),
+        human_size(len)
+    )
+}
+
+fn view_mode_for_file_len(requested: ViewMode, len: usize) -> ViewMode {
+    if requested == ViewMode::Text && len > TEXT_VIEW_LIMIT {
+        ViewMode::Hex
+    } else {
+        requested
+    }
+}
+
+fn text_view_fallback_status(len: usize) -> String {
+    format!(
+        "File is {} — too large for the Text view, showing Hex",
         human_size(len)
     )
 }
@@ -1043,7 +1038,7 @@ impl Default for HexedApp {
             vt: Vt::new(load_vt_enabled()),
             disasm_bits: 0,
             bytes_per_row: BYTES_PER_ROW,
-            view: load_view(),
+            view: DEFAULT_VIEW_MODE,
             insert_count: 1,
             base_width: 4,
             base_edit: String::new(),
@@ -1079,12 +1074,11 @@ impl HexedApp {
                 // A file past the Text view's limit would render as nothing but a
                 // greyed-out notice, which reads as "it failed to open" even though
                 // it loaded and analyzed fine. Drop to Hex so the bytes are there.
-                // Deliberately not persisted via `save_view`: this is an
-                // accommodation for one file, not a change of preference.
-                let fell_back = len > TEXT_VIEW_LIMIT && self.view == ViewMode::Text;
-                if fell_back {
-                    self.view = ViewMode::Hex;
-                }
+                // Text remains available for smaller files, but large files
+                // always land in the byte-accurate view instead of a notice pane.
+                let requested_view = self.view;
+                self.view = view_mode_for_file_len(requested_view, len);
+                let fell_back = requested_view != self.view;
                 self.status = if fell_back {
                     format!(
                         "Opened {} ({}) — too large for the Text view, showing Hex",
@@ -3666,11 +3660,15 @@ impl eframe::App for HexedApp {
         self.yara_has_context = yara_has_context;
         self.disasm_bits = disasm_bits;
         self.bytes_per_row = bytes_per_row;
-        if view_mode != self.view {
-            if self.view == ViewMode::Text {
-                self.commit_text(self.active); // leaving text view: flush edits
+        let requested_view = view_mode;
+        if let Some(len) = self.docs.get(a).map(|d| d.buffer.len()) {
+            view_mode = view_mode_for_file_len(view_mode, len);
+            if requested_view != view_mode {
+                self.status = text_view_fallback_status(len);
             }
-            save_view(view_mode);
+        }
+        if view_mode != self.view && self.view == ViewMode::Text {
+            self.commit_text(self.active); // leaving text view: flush edits
         }
         self.view = view_mode;
         self.insert_count = insert_count;
@@ -6270,5 +6268,53 @@ mod text_view_notice_tests {
     fn limit_in_text_tracks_the_const() {
         let msg = text_view_too_large_msg(TEXT_VIEW_LIMIT + 1);
         assert!(msg.contains(&super::human_size(TEXT_VIEW_LIMIT)), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod view_mode_tests {
+    use super::{
+        text_view_fallback_status, view_mode_for_file_len, ViewMode, DEFAULT_VIEW_MODE,
+        TEXT_VIEW_LIMIT,
+    };
+
+    #[test]
+    fn hex_is_the_startup_default() {
+        assert_eq!(DEFAULT_VIEW_MODE, ViewMode::Hex);
+    }
+
+    #[test]
+    fn text_view_is_allowed_through_the_limit() {
+        assert_eq!(
+            view_mode_for_file_len(ViewMode::Text, TEXT_VIEW_LIMIT),
+            ViewMode::Text
+        );
+    }
+
+    #[test]
+    fn files_past_the_text_limit_use_hex_even_when_text_was_requested() {
+        assert_eq!(
+            view_mode_for_file_len(ViewMode::Text, TEXT_VIEW_LIMIT + 1),
+            ViewMode::Hex
+        );
+        assert_eq!(
+            view_mode_for_file_len(ViewMode::Text, usize::MAX),
+            ViewMode::Hex
+        );
+    }
+
+    #[test]
+    fn hex_requests_stay_hex_for_any_file_size() {
+        assert_eq!(
+            view_mode_for_file_len(ViewMode::Hex, TEXT_VIEW_LIMIT + 1),
+            ViewMode::Hex
+        );
+    }
+
+    #[test]
+    fn fallback_status_says_hex_is_being_shown() {
+        let msg = text_view_fallback_status(TEXT_VIEW_LIMIT + 1);
+        assert!(msg.contains("too large for the Text view"), "{msg}");
+        assert!(msg.contains("showing Hex"), "{msg}");
     }
 }
