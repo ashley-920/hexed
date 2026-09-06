@@ -96,6 +96,72 @@ pub fn defang(s: &str) -> String {
     out.replace('.', "[.]")
 }
 
+/// A prepared IOC search query.
+///
+/// The panel tests this against every extracted indicator, and a crafted file
+/// can yield millions of them, so [`IocQuery::matches`] must not allocate. All
+/// the preparation happens once here: lowercasing, and *un*-defanging the query
+/// so one pasted out of a report (`evil[.]com`, `hxxps://`) finds the live value
+/// it was written from. Undoing the notation on the one short query is the cheap
+/// direction — defanging every value instead means three allocations per
+/// indicator per frame.
+#[derive(Clone, Debug, Default)]
+pub struct IocQuery {
+    /// Lowercased needles; a value matches if it contains any. Empty means no
+    /// filter was typed, which matches everything.
+    needles: Vec<String>,
+}
+
+impl IocQuery {
+    pub fn new(query: &str) -> Self {
+        let q = query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return Self::default();
+        }
+        let refanged = q.replace("[.]", ".").replace("hxxp", "http");
+        let mut needles = vec![q];
+        if refanged != needles[0] {
+            needles.push(refanged);
+        }
+        Self { needles }
+    }
+
+    /// True when no filter was typed, so every indicator passes.
+    pub fn is_empty(&self) -> bool {
+        self.needles.is_empty()
+    }
+
+    /// Whether `value` contains any needle, compared case-insensitively and
+    /// without allocating.
+    pub fn matches(&self, value: &str) -> bool {
+        self.needles.is_empty()
+            || self
+                .needles
+                .iter()
+                .any(|n| contains_ascii_ci(value.as_bytes(), n.as_bytes()))
+    }
+}
+
+/// Case-insensitive ASCII substring search that allocates nothing. `Ioc::value`
+/// is always ASCII (it comes from `strings::find_strings`, which keeps only
+/// printable ASCII), so a byte-wise fold is exact rather than an approximation.
+fn contains_ascii_ci(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if hay.len() < needle.len() {
+        return false;
+    }
+    hay.windows(needle.len())
+        .any(|w| w.iter().zip(needle).all(|(h, n)| h.eq_ignore_ascii_case(n)))
+}
+
+/// Convenience wrapper testing a single value. Build an [`IocQuery`] once and
+/// reuse it when testing many.
+pub fn ioc_matches(value: &str, query: &str) -> bool {
+    IocQuery::new(query).matches(value)
+}
+
 fn scan(t: &[u8], push: &mut impl FnMut(IocKind, String, usize)) {
     scan_urls(t, push);
     scan_emails(t, push);
@@ -709,5 +775,80 @@ mod tests {
     fn defang_neutralizes() {
         assert_eq!(defang("http://evil.com"), "hxxp://evil[.]com");
         assert_eq!(defang("1.2.3.4"), "1[.]2[.]3[.]4");
+    }
+
+    #[test]
+    fn empty_query_matches_everything() {
+        assert!(ioc_matches("evil.com", ""));
+        assert!(ioc_matches("evil.com", "   "));
+        assert!(ioc_matches("", ""));
+    }
+
+    #[test]
+    fn matches_are_case_insensitive_substrings() {
+        assert!(ioc_matches("http://EVIL.example.com/x", "evil"));
+        assert!(ioc_matches("evil.example.com", "EXAMPLE"));
+        assert!(ioc_matches("C:\\Windows\\System32\\evil.dll", "system32"));
+        assert!(!ioc_matches("evil.example.com", "goodware"));
+    }
+
+    #[test]
+    fn defanged_query_finds_the_live_value() {
+        // An analyst pasting an indicator back out of a report should still
+        // land on the original.
+        assert!(ioc_matches("evil.com", "evil[.]com"));
+        assert!(ioc_matches("1.2.3.4", "1[.]2[.]3[.]4"));
+        assert!(ioc_matches("http://evil.com/beacon", "hxxp://evil[.]com"));
+        assert!(ioc_matches("https://evil.com", "hxxps://"));
+    }
+
+    #[test]
+    fn defanged_query_still_has_to_match() {
+        assert!(!ioc_matches("good.com", "evil[.]com"));
+        assert!(!ioc_matches("1.2.3.4", "9[.]9[.]9[.]9"));
+    }
+
+    #[test]
+    fn partial_and_boundary_queries_behave() {
+        // Substring semantics, not token or prefix matching.
+        assert!(ioc_matches("evil.example.com", ".example."));
+        assert!(ioc_matches("185.220.101.7", "220.101"));
+        // A query longer than the value can never match.
+        assert!(!ioc_matches("a.com", "aaaaaaaaaaa.com"));
+    }
+
+    #[test]
+    fn partially_defanged_queries_match() {
+        // `hxxp://` with the dots left intact is what analysts actually paste,
+        // and matching only the fully-defanged spelling used to miss it.
+        assert!(ioc_matches("http://evil.com", "hxxp://evil.com"));
+        assert!(ioc_matches("http://evil.com", "hxxp://evil[.]com"));
+        assert!(ioc_matches("https://evil.com/a", "hxxps://evil.com"));
+    }
+
+    #[test]
+    fn a_prepared_query_matches_the_same_values() {
+        let q = IocQuery::new("EVIL[.]example");
+        assert!(!q.is_empty());
+        assert!(q.matches("evil.example.com"));
+        assert!(q.matches("http://sub.EVIL.example.org"));
+        assert!(!q.matches("good.example.com"));
+    }
+
+    #[test]
+    fn an_empty_prepared_query_passes_everything() {
+        let q = IocQuery::new("   ");
+        assert!(q.is_empty());
+        assert!(q.matches("anything at all"));
+        assert!(q.matches(""));
+    }
+
+    #[test]
+    fn ascii_ci_search_handles_boundaries() {
+        assert!(contains_ascii_ci(b"abc", b"abc"));
+        assert!(contains_ascii_ci(b"abc", b""));
+        assert!(contains_ascii_ci(b"xxABCxx", b"abc"));
+        assert!(!contains_ascii_ci(b"ab", b"abc"));
+        assert!(!contains_ascii_ci(b"", b"a"));
     }
 }
