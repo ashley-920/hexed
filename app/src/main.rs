@@ -256,6 +256,15 @@ enum CopyKind {
     Base64,
 }
 
+/// Which indicators the IOCs panel's two copy buttons put on the clipboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IocCopy {
+    /// Only the check-marked indicators.
+    Selected,
+    /// Every extracted indicator, regardless of the panel's filter.
+    All,
+}
+
 /// How the central pane renders the file: the hex+ASCII grid or a text view.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -1231,7 +1240,8 @@ impl eframe::App for HexedApp {
         }
         let flash = |id: &str| self.copy_flash_id == id && now < self.copy_flash_until;
         let flash_triage = flash("triage");
-        let flash_iocs = flash("iocs");
+        let flash_iocs_sel = flash("iocs_sel");
+        let flash_iocs_all = flash("iocs_all");
         let flash_pe = flash("pe_report");
 
         // ---- keyboard shortcuts ----
@@ -1783,7 +1793,7 @@ impl eframe::App for HexedApp {
         // triage-panel actions
         let mut action_triage = false;
         let mut carve_embedded: Option<(usize, Option<usize>)> = None;
-        let mut copy_iocs: Option<bool> = None; // Some(defang) -> copy all IOCs
+        let mut copy_iocs: Option<(IocCopy, bool)> = None; // (scope, defang)
         let mut ioc_defang = self.docs.get(a).map(|d| d.ioc_defang).unwrap_or(true);
         let mut vt_enabled = self.vt.enabled;
         let mut vt_open = false;
@@ -2373,23 +2383,26 @@ impl eframe::App for HexedApp {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut ioc_defang, "defang")
                                     .on_hover_text("render safe (hxxp://, 1[.]2[.]3[.]4)");
-                                let ioc_label = if flash_iocs {
-                                    "Copied!"
-                                } else if ioc_filtered {
-                                    "Copy shown"
-                                } else {
-                                    "Copy all"
-                                };
+                                let checked = yara_ioc_keys.len();
+                                let sel_label = if flash_iocs_sel { "Copied!" } else { "Copy" };
                                 if ui
-                                    .button(ioc_label)
-                                    .on_hover_text(if ioc_filtered {
-                                        "copy only the indicators matching the filter below"
-                                    } else {
-                                        "copy every extracted indicator"
-                                    })
+                                    .add_enabled(checked > 0, egui::Button::new(sel_label))
+                                    .on_hover_text(
+                                        "copy the check-marked indicators only",
+                                    )
                                     .clicked()
                                 {
-                                    copy_iocs = Some(ioc_defang);
+                                    copy_iocs = Some((IocCopy::Selected, ioc_defang));
+                                }
+                                let all_label = if flash_iocs_all { "Copied!" } else { "Copy all" };
+                                if ui
+                                    .button(all_label)
+                                    .on_hover_text(
+                                        "copy every extracted indicator, ignoring the filter",
+                                    )
+                                    .clicked()
+                                {
+                                    copy_iocs = Some((IocCopy::All, ioc_defang));
                                 }
                             });
                             ui.horizontal(|ui| {
@@ -4242,20 +4255,26 @@ impl eframe::App for HexedApp {
             }
         }
 
-        // ---- copy the IOCs currently listed in the panel to the clipboard ----
-        // Honours the panel's search box and kind toggles, so what lands on the
-        // clipboard is what the analyst can see — the button relabels to
-        // "Copy shown" whenever a filter is narrowing the list.
-        if let Some(defanged) = copy_iocs {
+        // ---- copy IOCs to the clipboard ----
+        // Two scopes, matching the two buttons. Neither consults the panel's
+        // filter: "Copy" is driven by the checkboxes and "Copy all" means all,
+        // so the clipboard always matches what the button label promises.
+        if let Some((scope, defanged)) = copy_iocs {
             if let Some(d) = self.docs.get(a) {
                 let mut s = String::new();
+                let mut copied = 0usize;
                 for kind in IOC_KINDS {
                     let group: Vec<&Ioc> = d
                         .iocs
                         .iter()
                         .filter(|i| {
                             i.kind == *kind
-                                && ioc_visible(i, &self.ioc_filter, &self.ioc_kinds_hidden)
+                                && match scope {
+                                    IocCopy::Selected => {
+                                        d.yara_ioc_keys.contains(&(i.offset, i.kind))
+                                    }
+                                    IocCopy::All => true,
+                                }
                         })
                         .collect();
                     if group.is_empty() {
@@ -4270,13 +4289,22 @@ impl eframe::App for HexedApp {
                         };
                         s.push_str(&v);
                         s.push('\n');
+                        copied += 1;
                     }
                     s.push('\n');
                 }
                 if !s.is_empty() {
                     ctx.copy_text(s);
-                    self.status = "IOCs copied to clipboard".to_string();
-                    self.copy_flash_id = "iocs";
+                    self.status = match scope {
+                        IocCopy::Selected => {
+                            format!("{copied} selected IOCs copied to clipboard")
+                        }
+                        IocCopy::All => format!("{copied} IOCs copied to clipboard"),
+                    };
+                    self.copy_flash_id = match scope {
+                        IocCopy::Selected => "iocs_sel",
+                        IocCopy::All => "iocs_all",
+                    };
                     self.copy_flash_until = now + 1.2;
                 }
             }
