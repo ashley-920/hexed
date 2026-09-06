@@ -17,9 +17,9 @@ use hexed_core::{
     FoundString, Hashes, PeInfo, ScoredKey, StringKind, YaraMatch,
 };
 use hexed_core::{
-    byte_histogram, defang, diff_aligned, extract_iocs, find_embedded, imphash, ioc_matches,
-    md5_hex, scan_signatures, sha256_hex, suspicious_apis, ApiFlag, Embedded, Histogram, Ioc,
-    IocKind, SigHit,
+    byte_histogram, defang, diff_aligned, extract_iocs, find_embedded, imphash, md5_hex,
+    scan_signatures, sha256_hex, suspicious_apis, ApiFlag, Embedded, Histogram, Ioc, IocKind,
+    IocQuery, SigHit,
 };
 
 mod ai;
@@ -74,11 +74,97 @@ const IOC_KINDS: &[IocKind] = &[
     IocKind::Wallet,
 ];
 
-/// Whether an indicator survives the IOCs panel's kind toggles and search box.
-/// The panel header count and the rendered rows share this one predicate so the
-/// "shown / total" tally can never disagree with what is actually listed.
-fn ioc_visible(ioc: &Ioc, query: &str, hidden_kinds: &std::collections::BTreeSet<IocKind>) -> bool {
-    !hidden_kinds.contains(&ioc.kind) && ioc_matches(&ioc.value, query)
+/// How many rows the IOCs panel lists per kind. Matches past this are counted
+/// but not drawn, so a file yielding millions of indicators cannot make the
+/// panel lay out millions of labels.
+const IOC_ROWS_PER_KIND: usize = 300;
+
+/// Position of `kind` in `IOC_KINDS`. A match rather than a lookup so bucketing
+/// is O(1) — it runs once per indicator per rebuild, and a crafted file can
+/// supply millions. `ioc_slot_matches_kind_order` pins it to `IOC_KINDS`.
+fn ioc_slot(kind: IocKind) -> usize {
+    match kind {
+        IocKind::Url => 0,
+        IocKind::Domain => 1,
+        IocKind::Ipv4 => 2,
+        IocKind::Email => 3,
+        IocKind::WinPath => 4,
+        IocKind::UnixPath => 5,
+        IocKind::Registry => 6,
+        IocKind::Wallet => 7,
+    }
+}
+
+/// The IOCs panel's filtered view of one document, rebuilt only when the filter
+/// or the indicator list changes.
+///
+/// Every number the panel prints — the kind chips, the group headings, the
+/// tally — comes from the same pass that picked the rows, so a count can never
+/// describe a different set than the one listed. Caching it also keeps a file
+/// with very many indicators from re-filtering on every frame: egui repaints on
+/// pointer movement and on the search box's caret blink, so a per-frame filter
+/// over millions of values stalls the UI and does not recover on its own.
+#[derive(Default)]
+struct IocView {
+    /// Filter state this was built for; a mismatch triggers a rebuild.
+    query: String,
+    hidden: std::collections::BTreeSet<IocKind>,
+    /// `iocs.len()` this was built against, so a rescan invalidates it.
+    stamp: usize,
+    built: bool,
+    /// Indices into `Document::iocs`, one bucket per `IOC_KINDS` slot, each
+    /// capped at `IOC_ROWS_PER_KIND` — exactly the rows drawn.
+    rows: Vec<Vec<usize>>,
+    /// Per-slot count matching the search box, ignoring the kind toggles, so a
+    /// chip can advertise what switching it back on would reveal.
+    matched: Vec<usize>,
+    /// Per-slot count ignoring every filter.
+    totals: Vec<usize>,
+    /// Rows actually listed, and matches surviving both filters.
+    listed: usize,
+    visible: usize,
+}
+
+impl IocView {
+    fn refresh(&mut self, iocs: &[Ioc], query: &str, hidden: &std::collections::BTreeSet<IocKind>) {
+        if self.built && self.stamp == iocs.len() && self.query == query && &self.hidden == hidden {
+            return;
+        }
+        let q = IocQuery::new(query);
+        let slots = IOC_KINDS.len();
+        self.rows = vec![Vec::new(); slots];
+        self.matched = vec![0; slots];
+        self.totals = vec![0; slots];
+        self.listed = 0;
+        self.visible = 0;
+        // One pass over the indicators rather than one per kind: eight passes
+        // over a multi-million-entry list is eight times more work than needed.
+        for (idx, ioc) in iocs.iter().enumerate() {
+            let slot = ioc_slot(ioc.kind);
+            self.totals[slot] += 1;
+            if !q.matches(&ioc.value) {
+                continue;
+            }
+            self.matched[slot] += 1;
+            if hidden.contains(&ioc.kind) {
+                continue;
+            }
+            self.visible += 1;
+            if self.rows[slot].len() < IOC_ROWS_PER_KIND {
+                self.rows[slot].push(idx);
+                self.listed += 1;
+            }
+        }
+        self.query = query.to_string();
+        self.hidden = hidden.clone();
+        self.stamp = iocs.len();
+        self.built = true;
+    }
+
+    /// True when matches were dropped by the per-kind row cap.
+    fn capped(&self) -> bool {
+        self.listed < self.visible
+    }
 }
 
 /// The app icon, embedded so it's available for the window icon, the About box,
@@ -330,6 +416,8 @@ struct Document {
     icon_tex: Option<egui::TextureHandle>,
     /// Extracted network/host indicators (cached; recomputed on edit).
     iocs: Vec<Ioc>,
+    /// Cached filtered view of `iocs` for the IOCs panel.
+    ioc_view: IocView,
     /// IOC identities selected for YARA generation. The kind disambiguates
     /// indicators that begin at the same byte offset.
     yara_ioc_keys: std::collections::BTreeSet<(usize, IocKind)>,
@@ -407,6 +495,7 @@ impl Document {
             icon_dims: (0, 0),
             icon_tex: None,
             iocs: Vec::new(),
+            ioc_view: IocView::default(),
             yara_ioc_keys: std::collections::BTreeSet::new(),
             embedded: Vec::new(),
             sig_hits: Vec::new(),
@@ -1181,6 +1270,19 @@ impl HexedApp {
     }
 }
 
+impl HexedApp {
+    /// Bring the active document's IOC view in step with the panel's filter.
+    /// A no-op when neither the filter nor the indicator list has changed,
+    /// which is every frame that is not a keystroke in the search box.
+    fn refresh_ioc_view(&mut self, a: usize) {
+        let query = self.ioc_filter.clone();
+        let hidden = self.ioc_kinds_hidden.clone();
+        if let Some(d) = self.docs.get_mut(a) {
+            d.ioc_view.refresh(&d.iocs, &query, &hidden);
+        }
+    }
+}
+
 impl eframe::App for HexedApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ---- AI worker: drain results; route them on completion ----
@@ -1323,6 +1425,7 @@ impl eframe::App for HexedApp {
 
         let a = self.active;
         let has_doc = self.docs.get(a).is_some();
+        self.refresh_ioc_view(a);
 
         // ---- select all (⌘A) ----
         if action_select_all {
@@ -2355,25 +2458,13 @@ impl eframe::App for HexedApp {
                     });
                 ui.separator();
 
-                // IOCs — extracted network / host indicators
+                // IOCs — extracted network / host indicators.
+                // The header stays a plain total: it is built before the body, so
+                // any filtered figure here would describe the previous frame's
+                // filter. The tally that reflects the filter is drawn after the
+                // rows, from the same pass that chose them.
                 let ioc_count = self.docs.get(a).map(|d| d.iocs.len()).unwrap_or(0);
-                let ioc_shown = self
-                    .docs
-                    .get(a)
-                    .map(|d| {
-                        d.iocs
-                            .iter()
-                            .filter(|i| ioc_visible(i, &ioc_filter, &ioc_kinds_hidden))
-                            .count()
-                    })
-                    .unwrap_or(0);
-                let ioc_filtered = ioc_shown != ioc_count;
-                let ioc_header = if ioc_filtered {
-                    format!("IOCs ({ioc_shown} / {ioc_count})")
-                } else {
-                    format!("IOCs ({ioc_count})")
-                };
-                egui::CollapsingHeader::new(ioc_header)
+                egui::CollapsingHeader::new(format!("IOCs ({ioc_count})"))
                     .id_salt("iocs_panel")
                     .default_open(ioc_count > 0)
                     .show(ui, |ui| {
@@ -2384,11 +2475,15 @@ impl eframe::App for HexedApp {
                                 ui.checkbox(&mut ioc_defang, "defang")
                                     .on_hover_text("render safe (hxxp://, 1[.]2[.]3[.]4)");
                                 let checked = yara_ioc_keys.len();
-                                let sel_label = if flash_iocs_sel { "Copied!" } else { "Copy" };
+                                let sel_label = if flash_iocs_sel {
+                                    "Copied!".to_string()
+                                } else {
+                                    format!("Copy ({checked})")
+                                };
                                 if ui
                                     .add_enabled(checked > 0, egui::Button::new(sel_label))
                                     .on_hover_text(
-                                        "copy the check-marked indicators only",
+                                        "copy the check-marked indicators, including any the filter is hiding",
                                     )
                                     .clicked()
                                 {
@@ -2416,14 +2511,18 @@ impl eframe::App for HexedApp {
                                     ioc_filter.clear();
                                 }
                             });
-                            ui.horizontal_wrapped(|ui| {
-                                if let Some(d) = self.docs.get(a) {
-                                    for kind in IOC_KINDS {
-                                        let n = d.iocs.iter().filter(|i| i.kind == *kind).count();
-                                        if n == 0 {
+                            if let Some(d) = self.docs.get(a) {
+                                ui.horizontal_wrapped(|ui| {
+                                    for (slot, kind) in IOC_KINDS.iter().enumerate() {
+                                        // Gated on the unfiltered count so a kind switched
+                                        // off never loses the control that switches it back
+                                        // on, but labelled with the count that matches the
+                                        // search box.
+                                        if d.ioc_view.totals[slot] == 0 {
                                             continue;
                                         }
                                         let on = !ioc_kinds_hidden.contains(kind);
+                                        let n = d.ioc_view.matched[slot];
                                         if ui
                                             .selectable_label(on, format!("{} {n}", kind.label()))
                                             .on_hover_text("show or hide this indicator kind")
@@ -2436,8 +2535,8 @@ impl eframe::App for HexedApp {
                                             }
                                         }
                                     }
-                                }
-                            });
+                                });
+                            }
                             ui.horizontal_wrapped(|ui| {
                                 let selected = yara_ioc_keys.len();
                                 if ui
@@ -2461,31 +2560,29 @@ impl eframe::App for HexedApp {
                                 }
                             });
                             if let Some(d) = self.docs.get(a) {
-                                let mut any_shown = false;
-                                for kind in IOC_KINDS {
-                                    let group: Vec<&Ioc> = d
-                                        .iocs
-                                        .iter()
-                                        .filter(|i| {
-                                            i.kind == *kind
-                                                && ioc_visible(i, &ioc_filter, &ioc_kinds_hidden)
-                                        })
-                                        .collect();
-                                    if group.is_empty() {
+                                for (slot, kind) in IOC_KINDS.iter().enumerate() {
+                                    let rows = &d.ioc_view.rows[slot];
+                                    if rows.is_empty() {
                                         continue;
                                     }
-                                    any_shown = true;
+                                    let matched = d.ioc_view.matched[slot];
                                     ui.add_space(2.0);
+                                    // Say "300 of 3240" rather than "3240" when the row cap
+                                    // bit, so the heading counts rows the analyst can see.
+                                    let heading = if rows.len() < matched {
+                                        format!("{} ({} of {})", kind.label(), rows.len(), matched)
+                                    } else {
+                                        format!("{} ({matched})", kind.label())
+                                    };
                                     ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} ({})",
-                                            kind.label(),
-                                            group.len()
-                                        ))
-                                        .color(self.palette.dim)
-                                        .size(11.0),
+                                        egui::RichText::new(heading)
+                                            .color(self.palette.dim)
+                                            .size(11.0),
                                     );
-                                    for ioc in group.iter().take(300) {
+                                    for &idx in rows {
+                                        let Some(ioc) = d.iocs.get(idx) else {
+                                            continue;
+                                        };
                                         let key = (ioc.offset, ioc.kind);
                                         let shown = if ioc_defang {
                                             defang(&ioc.value)
@@ -2526,8 +2623,15 @@ impl eframe::App for HexedApp {
                                         });
                                     }
                                 }
-                                if !any_shown {
+                                ui.add_space(2.0);
+                                if d.ioc_view.visible == 0 {
                                     ui.weak("No indicators match the filter.");
+                                } else {
+                                    ui.weak(format!(
+                                        "{} shown / {ioc_count} total{}",
+                                        d.ioc_view.listed,
+                                        if d.ioc_view.capped() { " (capped)" } else { "" }
+                                    ));
                                 }
                             }
                         }
@@ -6282,7 +6386,8 @@ rule pe_template {
 
 #[cfg(test)]
 mod ioc_filter_tests {
-    use super::{ioc_visible, Ioc, IocKind, StringKind, IOC_KINDS};
+    use super::{ioc_slot, IocView, IOC_KINDS, IOC_ROWS_PER_KIND};
+    use hexed_core::{Ioc, IocKind, StringKind};
 
     fn ioc(kind: IocKind, value: &str) -> Ioc {
         Ioc {
@@ -6298,66 +6403,111 @@ mod ioc_filter_tests {
         kinds.iter().copied().collect()
     }
 
+    fn view(iocs: &[Ioc], query: &str, hide: &[IocKind]) -> IocView {
+        let mut v = IocView::default();
+        v.refresh(iocs, query, &hidden(hide));
+        v
+    }
+
     #[test]
-    fn no_filter_shows_every_kind() {
-        let none = hidden(&[]);
-        for kind in IOC_KINDS {
-            assert!(ioc_visible(&ioc(*kind, "evil.example.com"), "", &none));
+    fn ioc_slot_matches_kind_order() {
+        // The view buckets by `ioc_slot` but the panel walks `IOC_KINDS`, so a
+        // divergence would silently file indicators under the wrong heading.
+        for (i, kind) in IOC_KINDS.iter().enumerate() {
+            assert_eq!(ioc_slot(*kind), i, "{kind:?}");
         }
     }
 
     #[test]
-    fn hidden_kind_is_excluded_whatever_the_query() {
-        let h = hidden(&[IocKind::Domain]);
-        assert!(!ioc_visible(
-            &ioc(IocKind::Domain, "evil.example.com"),
-            "",
-            &h
-        ));
-        assert!(!ioc_visible(
-            &ioc(IocKind::Domain, "evil.example.com"),
-            "evil",
-            &h
-        ));
-        // The same text under a kind that is still on remains visible.
-        assert!(ioc_visible(
-            &ioc(IocKind::Url, "http://evil.example.com"),
-            "evil",
-            &h
-        ));
+    fn no_filter_lists_every_indicator() {
+        let iocs = vec![
+            ioc(IocKind::Url, "http://evil.example.com"),
+            ioc(IocKind::Domain, "evil.example.com"),
+            ioc(IocKind::Ipv4, "185.220.101.7"),
+        ];
+        let v = view(&iocs, "", &[]);
+        assert_eq!(v.visible, 3);
+        assert_eq!(v.listed, 3);
+        assert!(!v.capped());
     }
 
     #[test]
-    fn query_and_kind_filters_compose() {
-        let h = hidden(&[IocKind::Ipv4]);
-        assert!(ioc_visible(
-            &ioc(IocKind::Url, "http://evil.example.com"),
-            "evil",
-            &h
-        ));
-        assert!(!ioc_visible(
-            &ioc(IocKind::Url, "http://good.example.com"),
-            "evil",
-            &h
-        ));
-        assert!(!ioc_visible(&ioc(IocKind::Ipv4, "1.2.3.4"), "1.2", &h));
+    fn hidden_kinds_drop_rows_but_keep_their_chip_count() {
+        let iocs = vec![
+            ioc(IocKind::Url, "http://evil.example.com"),
+            ioc(IocKind::Domain, "evil.example.com"),
+        ];
+        let v = view(&iocs, "evil", &[IocKind::Domain]);
+        assert_eq!(v.visible, 1, "only the URL survives the kind toggle");
+        assert!(v.rows[ioc_slot(IocKind::Domain)].is_empty());
+        // The chip has to advertise what switching the kind back on would show.
+        assert_eq!(v.matched[ioc_slot(IocKind::Domain)], 1);
+        assert_eq!(v.totals[ioc_slot(IocKind::Domain)], 1);
     }
 
     #[test]
-    fn hiding_every_kind_hides_everything() {
-        let h = hidden(IOC_KINDS);
-        for kind in IOC_KINDS {
-            assert!(!ioc_visible(&ioc(*kind, "evil.example.com"), "", &h));
-        }
+    fn query_matches_the_defanged_form() {
+        let iocs = vec![ioc(IocKind::Domain, "evil.example.com")];
+        assert_eq!(view(&iocs, "evil[.]example", &[]).visible, 1);
+        assert_eq!(view(&iocs, "EVIL", &[]).visible, 1);
+        assert_eq!(view(&iocs, "goodware", &[]).visible, 0);
     }
 
     #[test]
-    fn defanged_query_reaches_the_live_value_through_the_panel_predicate() {
-        let none = hidden(&[]);
-        assert!(ioc_visible(
-            &ioc(IocKind::Domain, "evil.example.com"),
-            "evil[.]example",
-            &none
-        ));
+    fn rows_are_capped_per_kind_and_the_cap_is_reported() {
+        let n = IOC_ROWS_PER_KIND + 25;
+        let iocs: Vec<Ioc> = (0..n)
+            .map(|i| ioc(IocKind::Domain, &format!("host{i}.example.com")))
+            .collect();
+        let v = view(&iocs, "", &[]);
+        assert_eq!(v.visible, n, "every match is counted");
+        assert_eq!(v.listed, IOC_ROWS_PER_KIND, "but only the cap is listed");
+        assert!(v.capped(), "and the panel must be able to say so");
+    }
+
+    #[test]
+    fn refresh_rebuilds_when_the_filter_changes() {
+        let iocs = vec![
+            ioc(IocKind::Domain, "evil.example.com"),
+            ioc(IocKind::Domain, "good.example.com"),
+        ];
+        let mut v = IocView::default();
+        v.refresh(&iocs, "", &hidden(&[]));
+        assert_eq!(v.visible, 2);
+        v.refresh(&iocs, "evil", &hidden(&[]));
+        assert_eq!(v.visible, 1, "a changed query must invalidate the cache");
+        v.refresh(&iocs, "evil", &hidden(&[IocKind::Domain]));
+        assert_eq!(v.visible, 0, "a changed kind set must invalidate it too");
+        v.refresh(&iocs, "", &hidden(&[]));
+        assert_eq!(v.visible, 2, "and clearing the filter must bring it back");
+    }
+
+    #[test]
+    fn refresh_notices_a_rescan_that_changes_the_indicator_list() {
+        let one = vec![ioc(IocKind::Domain, "evil.example.com")];
+        let two = vec![
+            ioc(IocKind::Domain, "evil.example.com"),
+            ioc(IocKind::Domain, "evil.other.com"),
+        ];
+        let mut v = IocView::default();
+        v.refresh(&one, "evil", &hidden(&[]));
+        assert_eq!(v.visible, 1);
+        v.refresh(&two, "evil", &hidden(&[]));
+        assert_eq!(
+            v.visible, 2,
+            "a re-extracted list must invalidate the cache"
+        );
+    }
+
+    #[test]
+    fn rows_hold_indices_into_the_indicator_list() {
+        let iocs = vec![
+            ioc(IocKind::Domain, "good.example.com"),
+            ioc(IocKind::Domain, "evil.example.com"),
+        ];
+        let v = view(&iocs, "evil", &[]);
+        let rows = &v.rows[ioc_slot(IocKind::Domain)];
+        assert_eq!(rows.as_slice(), [1]);
+        assert_eq!(iocs[rows[0]].value, "evil.example.com");
     }
 }
