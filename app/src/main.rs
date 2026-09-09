@@ -4293,6 +4293,12 @@ impl eframe::App for HexedApp {
                         }
                         ui.heading("Hexed");
                         ui.label("hex editor & malware-triage tool");
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Created by Chi-en (Ashley) Shen")
+                                .weak()
+                                .size(11.0),
+                        );
                         ui.add_space(8.0);
                         if ui.button("Export icon as PNG…").clicked() {
                             export_icon = true;
