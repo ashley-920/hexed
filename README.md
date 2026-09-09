@@ -163,6 +163,10 @@ hexed/
 └─ app/                 # egui/eframe shell (thin; all logic lives in core)
 ```
 
+## Author
+
+Built by **Chi-en (Ashley) Shen** — [ashley.hacksbetweenus.com](https://ashley.hacksbetweenus.com/).
+
 ## License
 
 MIT — see [LICENSE](LICENSE). A defensive research tool; use it on samples you're authorized to analyze.
