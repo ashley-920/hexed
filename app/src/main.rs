@@ -19,7 +19,7 @@ use hexed_core::{
 use hexed_core::{
     byte_histogram, defang, diff_aligned, extract_iocs, find_embedded, imphash, md5_hex,
     scan_signatures, sha256_hex, suspicious_apis, ApiFlag, Embedded, Histogram, Ioc, IocKind,
-    SigHit,
+    IocQuery, SigHit,
 };
 
 mod ai;
@@ -56,6 +56,12 @@ type HighlightCache = egui::util::cache::FrameCache<egui::text::LayoutJob, Highl
 /// Only syntax-highlight text up to this size; larger files render plain so the
 /// per-frame key hash / tokenization can't cost anything noticeable.
 const HL_LIMIT: usize = 512 * 1024;
+
+/// Largest file the Text view will render. Past this the wrapping galley layout
+/// costs more per frame than the view is worth, so it defers to the Hex view
+/// (which is virtualized and stays cheap at any size). Opening is *not* limited
+/// — the whole file is loaded and analyzed regardless of this.
+const TEXT_VIEW_LIMIT: usize = 1024 * 1024;
 use ai::Ai;
 use theme::{Palette, Theme};
 use vt::Vt;
@@ -73,6 +79,99 @@ const IOC_KINDS: &[IocKind] = &[
     IocKind::Registry,
     IocKind::Wallet,
 ];
+
+/// How many rows the IOCs panel lists per kind. Matches past this are counted
+/// but not drawn, so a file yielding millions of indicators cannot make the
+/// panel lay out millions of labels.
+const IOC_ROWS_PER_KIND: usize = 300;
+
+/// Position of `kind` in `IOC_KINDS`. A match rather than a lookup so bucketing
+/// is O(1) — it runs once per indicator per rebuild, and a crafted file can
+/// supply millions. `ioc_slot_matches_kind_order` pins it to `IOC_KINDS`.
+fn ioc_slot(kind: IocKind) -> usize {
+    match kind {
+        IocKind::Url => 0,
+        IocKind::Domain => 1,
+        IocKind::Ipv4 => 2,
+        IocKind::Email => 3,
+        IocKind::WinPath => 4,
+        IocKind::UnixPath => 5,
+        IocKind::Registry => 6,
+        IocKind::Wallet => 7,
+    }
+}
+
+/// The IOCs panel's filtered view of one document, rebuilt only when the filter
+/// or the indicator list changes.
+///
+/// Every number the panel prints — the kind chips, the group headings, the
+/// tally — comes from the same pass that picked the rows, so a count can never
+/// describe a different set than the one listed. Caching it also keeps a file
+/// with very many indicators from re-filtering on every frame: egui repaints on
+/// pointer movement and on the search box's caret blink, so a per-frame filter
+/// over millions of values stalls the UI and does not recover on its own.
+#[derive(Default)]
+struct IocView {
+    /// Filter state this was built for; a mismatch triggers a rebuild.
+    query: String,
+    hidden: std::collections::BTreeSet<IocKind>,
+    /// `iocs.len()` this was built against, so a rescan invalidates it.
+    stamp: usize,
+    built: bool,
+    /// Indices into `Document::iocs`, one bucket per `IOC_KINDS` slot, each
+    /// capped at `IOC_ROWS_PER_KIND` — exactly the rows drawn.
+    rows: Vec<Vec<usize>>,
+    /// Per-slot count matching the search box, ignoring the kind toggles, so a
+    /// chip can advertise what switching it back on would reveal.
+    matched: Vec<usize>,
+    /// Per-slot count ignoring every filter.
+    totals: Vec<usize>,
+    /// Rows actually listed, and matches surviving both filters.
+    listed: usize,
+    visible: usize,
+}
+
+impl IocView {
+    fn refresh(&mut self, iocs: &[Ioc], query: &str, hidden: &std::collections::BTreeSet<IocKind>) {
+        if self.built && self.stamp == iocs.len() && self.query == query && &self.hidden == hidden {
+            return;
+        }
+        let q = IocQuery::new(query);
+        let slots = IOC_KINDS.len();
+        self.rows = vec![Vec::new(); slots];
+        self.matched = vec![0; slots];
+        self.totals = vec![0; slots];
+        self.listed = 0;
+        self.visible = 0;
+        // One pass over the indicators rather than one per kind: eight passes
+        // over a multi-million-entry list is eight times more work than needed.
+        for (idx, ioc) in iocs.iter().enumerate() {
+            let slot = ioc_slot(ioc.kind);
+            self.totals[slot] += 1;
+            if !q.matches(&ioc.value) {
+                continue;
+            }
+            self.matched[slot] += 1;
+            if hidden.contains(&ioc.kind) {
+                continue;
+            }
+            self.visible += 1;
+            if self.rows[slot].len() < IOC_ROWS_PER_KIND {
+                self.rows[slot].push(idx);
+                self.listed += 1;
+            }
+        }
+        self.query = query.to_string();
+        self.hidden = hidden.clone();
+        self.stamp = iocs.len();
+        self.built = true;
+    }
+
+    /// True when matches were dropped by the per-kind row cap.
+    fn capped(&self) -> bool {
+        self.listed < self.visible
+    }
+}
 
 /// The app icon, embedded so it's available for the window icon, the About box,
 /// and export-to-PNG.
@@ -249,12 +348,23 @@ enum CopyKind {
     Base64,
 }
 
+/// Which indicators the IOCs panel's two copy buttons put on the clipboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IocCopy {
+    /// Only the check-marked indicators.
+    Selected,
+    /// Every extracted indicator, regardless of the panel's filter.
+    All,
+}
+
 /// How the central pane renders the file: the hex+ASCII grid or a text view.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewMode {
     Hex,
     Text,
 }
+
+const DEFAULT_VIEW_MODE: ViewMode = ViewMode::Hex;
 
 /// All state tied to one open file (one tab).
 struct Document {
@@ -314,6 +424,8 @@ struct Document {
     icon_tex: Option<egui::TextureHandle>,
     /// Extracted network/host indicators (cached; recomputed on edit).
     iocs: Vec<Ioc>,
+    /// Cached filtered view of `iocs` for the IOCs panel.
+    ioc_view: IocView,
     /// IOC identities selected for YARA generation. The kind disambiguates
     /// indicators that begin at the same byte offset.
     yara_ioc_keys: std::collections::BTreeSet<(usize, IocKind)>,
@@ -391,6 +503,7 @@ impl Document {
             icon_dims: (0, 0),
             icon_tex: None,
             iocs: Vec::new(),
+            ioc_view: IocView::default(),
             yara_ioc_keys: std::collections::BTreeSet::new(),
             embedded: Vec::new(),
             sig_hits: Vec::new(),
@@ -502,6 +615,10 @@ struct HexedApp {
     replace_query: String,
     bookmark_name: String,
     strings_filter: String,
+    /// Search box for the IOCs panel; matches raw and defanged renderings.
+    ioc_filter: String,
+    /// IOC kinds toggled off in the IOCs panel. Empty means every kind shows.
+    ioc_kinds_hidden: std::collections::BTreeSet<IocKind>,
     yara_source: String,
     /// Whether the editor contains analyst/generated YARA that must be kept
     /// when a saved template is applied. The untouched scaffold is disposable.
@@ -525,8 +642,12 @@ struct HexedApp {
     disasm_bits: u32,
     /// Bytes shown per row in the hex grid (8/16/32).
     bytes_per_row: usize,
-    /// Central-pane view: hex grid or text.
+    /// Central-pane view actually being rendered. May sit at Hex while
+    /// `view_pref` is Text, when the open file is past [`TEXT_VIEW_LIMIT`].
     view: ViewMode,
+    /// The view the user last chose, persisted across launches. Only an explicit
+    /// toggle moves this; an oversized-file fallback never does.
+    view_pref: ViewMode,
     /// Number of zero bytes the "Insert" button adds.
     insert_count: usize,
     /// Byte width for the inspector's number-base converter (1/2/4/8).
@@ -572,25 +693,92 @@ fn save_theme(t: Theme) {
 }
 
 /// Remember the central-pane view mode across launches (`~/.hexed_view.txt`).
+///
+/// This stores the view the user last *chose*, not necessarily the one on screen:
+/// opening an oversized file drops the pane to Hex (see [`view_mode_for_file_len`])
+/// without disturbing the preference, so the next small file returns to Text.
+/// Parse the stored view mode. Anything unrecognised (a truncated write, a
+/// hand-edited file, a stale value from a future version) falls back to the
+/// default rather than failing the launch.
+fn view_from_str(s: &str) -> ViewMode {
+    match s.trim() {
+        "text" => ViewMode::Text,
+        "hex" => ViewMode::Hex,
+        _ => DEFAULT_VIEW_MODE,
+    }
+}
+
+fn view_to_str(v: ViewMode) -> &'static str {
+    match v {
+        ViewMode::Text => "text",
+        ViewMode::Hex => "hex",
+    }
+}
+
 fn load_view() -> ViewMode {
     std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".hexed_view.txt"))
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| {
-            if s.trim() == "text" {
-                ViewMode::Text
-            } else {
-                ViewMode::Hex
-            }
-        })
-        .unwrap_or(ViewMode::Hex)
+        .map(|s| view_from_str(&s))
+        .unwrap_or(DEFAULT_VIEW_MODE)
 }
 
 fn save_view(v: ViewMode) {
     if let Some(h) = std::env::var_os("HOME") {
         let p = std::path::PathBuf::from(h).join(".hexed_view.txt");
-        let _ = std::fs::write(p, if v == ViewMode::Text { "text" } else { "hex" });
+        let _ = std::fs::write(p, view_to_str(v));
     }
+}
+
+/// Format a byte count for display: `1 byte`, `900 bytes`, `1.5 KB`, `4.0 MB`.
+/// Binary units (1 KB = 1024 bytes), matching how the size limits here are written.
+fn human_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if bytes == 1 {
+        "1 byte".to_string()
+    } else if b < KB {
+        format!("{bytes} bytes")
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.1} GB", b / GB)
+    }
+}
+
+/// The notice shown in place of the Text view for a file past [`TEXT_VIEW_LIMIT`].
+///
+/// Names the limit rather than only the file's size. Quoting the size alone
+/// ("File is 3.2 MB — too large") reads as if the cutoff were wherever that
+/// particular file happened to land, so every reader infers a different limit.
+/// It also says the file *did* load, because an otherwise-blank pane reads as a
+/// failed open.
+fn text_view_too_large_msg(len: usize) -> String {
+    format!(
+        "The text view is limited to {}; this file is {}. \
+         It is fully loaded — switch to the Hex view to read it.",
+        human_size(TEXT_VIEW_LIMIT),
+        human_size(len)
+    )
+}
+
+fn view_mode_for_file_len(requested: ViewMode, len: usize) -> ViewMode {
+    if requested == ViewMode::Text && len > TEXT_VIEW_LIMIT {
+        ViewMode::Hex
+    } else {
+        requested
+    }
+}
+
+fn text_view_fallback_status(len: usize) -> String {
+    format!(
+        "File is {} — too large for the Text view, showing Hex",
+        human_size(len)
+    )
 }
 
 /// A canned AI action triggered from the panel.
@@ -1005,6 +1193,8 @@ impl Default for HexedApp {
             replace_query: String::new(),
             bookmark_name: String::new(),
             strings_filter: String::new(),
+            ioc_filter: String::new(),
+            ioc_kinds_hidden: std::collections::BTreeSet::new(),
             yara_source: yara_template(),
             yara_has_context: false,
             yara_reveal_ttl: 0,
@@ -1017,6 +1207,7 @@ impl Default for HexedApp {
             disasm_bits: 0,
             bytes_per_row: BYTES_PER_ROW,
             view: load_view(),
+            view_pref: load_view(),
             insert_count: 1,
             base_width: 4,
             base_edit: String::new(),
@@ -1062,7 +1253,24 @@ impl HexedApp {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.status = format!("Opened {} ({} bytes)", name, buf.len());
+                let len = buf.len();
+                // A file past the Text view's limit would render as nothing but a
+                // greyed-out notice, which reads as "it failed to open" even though
+                // it loaded and analyzed fine. Drop to Hex so the bytes are there.
+                // Text remains available for smaller files, but large files
+                // always land in the byte-accurate view instead of a notice pane.
+                let requested_view = self.view_pref;
+                self.view = view_mode_for_file_len(requested_view, len);
+                let fell_back = requested_view != self.view;
+                self.status = if fell_back {
+                    format!(
+                        "Opened {} ({}) — too large for the Text view, showing Hex",
+                        name,
+                        human_size(len)
+                    )
+                } else {
+                    format!("Opened {} ({} bytes)", name, len)
+                };
                 self.docs.push(Document::new(buf, name));
                 self.active = self.docs.len() - 1;
                 if let Some(bms) = self.bookmarks_store.get(&path) {
@@ -1188,6 +1396,19 @@ impl HexedApp {
     }
 }
 
+impl HexedApp {
+    /// Bring the active document's IOC view in step with the panel's filter.
+    /// A no-op when neither the filter nor the indicator list has changed,
+    /// which is every frame that is not a keystroke in the search box.
+    fn refresh_ioc_view(&mut self, a: usize) {
+        let query = self.ioc_filter.clone();
+        let hidden = self.ioc_kinds_hidden.clone();
+        if let Some(d) = self.docs.get_mut(a) {
+            d.ioc_view.refresh(&d.iocs, &query, &hidden);
+        }
+    }
+}
+
 impl eframe::App for HexedApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ---- AI worker: drain results; route them on completion ----
@@ -1247,7 +1468,8 @@ impl eframe::App for HexedApp {
         }
         let flash = |id: &str| self.copy_flash_id == id && now < self.copy_flash_until;
         let flash_triage = flash("triage");
-        let flash_iocs = flash("iocs");
+        let flash_iocs_sel = flash("iocs_sel");
+        let flash_iocs_all = flash("iocs_all");
         let flash_pe = flash("pe_report");
 
         // ---- keyboard shortcuts ----
@@ -1333,6 +1555,7 @@ impl eframe::App for HexedApp {
 
         let a = self.active;
         let has_doc = self.docs.get(a).is_some();
+        self.refresh_ioc_view(a);
 
         // ---- select all (⌘A) ----
         if action_select_all {
@@ -1476,6 +1699,8 @@ impl eframe::App for HexedApp {
         let mut goto_query = self.goto_query.clone();
         let mut bookmark_name = self.bookmark_name.clone();
         let mut strings_filter = self.strings_filter.clone();
+        let mut ioc_filter = self.ioc_filter.clone();
+        let mut ioc_kinds_hidden = self.ioc_kinds_hidden.clone();
         let mut yara_string_offsets = self
             .docs
             .get(a)
@@ -1812,7 +2037,7 @@ impl eframe::App for HexedApp {
         // triage-panel actions
         let mut action_triage = false;
         let mut carve_embedded: Option<(usize, Option<usize>)> = None;
-        let mut copy_iocs: Option<bool> = None; // Some(defang) -> copy all IOCs
+        let mut copy_iocs: Option<(IocCopy, bool)> = None; // (scope, defang)
         let mut ioc_defang = self.docs.get(a).map(|d| d.ioc_defang).unwrap_or(true);
         let mut vt_enabled = self.vt.enabled;
         let mut vt_open = false;
@@ -2374,7 +2599,11 @@ impl eframe::App for HexedApp {
                     });
                 ui.separator();
 
-                // IOCs — extracted network / host indicators
+                // IOCs — extracted network / host indicators.
+                // The header stays a plain total: it is built before the body, so
+                // any filtered figure here would describe the previous frame's
+                // filter. The tally that reflects the filter is drawn after the
+                // rows, from the same pass that chose them.
                 let ioc_count = self.docs.get(a).map(|d| d.iocs.len()).unwrap_or(0);
                 egui::CollapsingHeader::new(format!("IOCs ({ioc_count})"))
                     .id_salt("iocs_panel")
@@ -2386,11 +2615,69 @@ impl eframe::App for HexedApp {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut ioc_defang, "defang")
                                     .on_hover_text("render safe (hxxp://, 1[.]2[.]3[.]4)");
-                                let ioc_label = if flash_iocs { "Copied!" } else { "Copy all" };
-                                if ui.button(ioc_label).clicked() {
-                                    copy_iocs = Some(ioc_defang);
+                                let checked = yara_ioc_keys.len();
+                                let sel_label = if flash_iocs_sel {
+                                    "Copied!".to_string()
+                                } else {
+                                    format!("Copy ({checked})")
+                                };
+                                if ui
+                                    .add_enabled(checked > 0, egui::Button::new(sel_label))
+                                    .on_hover_text(
+                                        "copy the check-marked indicators, including any the filter is hiding",
+                                    )
+                                    .clicked()
+                                {
+                                    copy_iocs = Some((IocCopy::Selected, ioc_defang));
+                                }
+                                let all_label = if flash_iocs_all { "Copied!" } else { "Copy all" };
+                                if ui
+                                    .button(all_label)
+                                    .on_hover_text(
+                                        "copy every extracted indicator, ignoring the filter",
+                                    )
+                                    .clicked()
+                                {
+                                    copy_iocs = Some((IocCopy::All, ioc_defang));
                                 }
                             });
+                            ui.horizontal(|ui| {
+                                ui.label("filter:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut ioc_filter)
+                                        .desired_width(170.0)
+                                        .hint_text("substring"),
+                                );
+                                if !ioc_filter.is_empty() && ui.small_button("×").clicked() {
+                                    ioc_filter.clear();
+                                }
+                            });
+                            if let Some(d) = self.docs.get(a) {
+                                ui.horizontal_wrapped(|ui| {
+                                    for (slot, kind) in IOC_KINDS.iter().enumerate() {
+                                        // Gated on the unfiltered count so a kind switched
+                                        // off never loses the control that switches it back
+                                        // on, but labelled with the count that matches the
+                                        // search box.
+                                        if d.ioc_view.totals[slot] == 0 {
+                                            continue;
+                                        }
+                                        let on = !ioc_kinds_hidden.contains(kind);
+                                        let n = d.ioc_view.matched[slot];
+                                        if ui
+                                            .selectable_label(on, format!("{} {n}", kind.label()))
+                                            .on_hover_text("show or hide this indicator kind")
+                                            .clicked()
+                                        {
+                                            if on {
+                                                ioc_kinds_hidden.insert(*kind);
+                                            } else {
+                                                ioc_kinds_hidden.remove(kind);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
                             ui.horizontal_wrapped(|ui| {
                                 let selected = yara_ioc_keys.len();
                                 if ui
@@ -2414,23 +2701,29 @@ impl eframe::App for HexedApp {
                                 }
                             });
                             if let Some(d) = self.docs.get(a) {
-                                for kind in IOC_KINDS {
-                                    let group: Vec<&Ioc> =
-                                        d.iocs.iter().filter(|i| i.kind == *kind).collect();
-                                    if group.is_empty() {
+                                for (slot, kind) in IOC_KINDS.iter().enumerate() {
+                                    let rows = &d.ioc_view.rows[slot];
+                                    if rows.is_empty() {
                                         continue;
                                     }
+                                    let matched = d.ioc_view.matched[slot];
                                     ui.add_space(2.0);
+                                    // Say "300 of 3240" rather than "3240" when the row cap
+                                    // bit, so the heading counts rows the analyst can see.
+                                    let heading = if rows.len() < matched {
+                                        format!("{} ({} of {})", kind.label(), rows.len(), matched)
+                                    } else {
+                                        format!("{} ({matched})", kind.label())
+                                    };
                                     ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} ({})",
-                                            kind.label(),
-                                            group.len()
-                                        ))
-                                        .color(self.palette.dim)
-                                        .size(11.0),
+                                        egui::RichText::new(heading)
+                                            .color(self.palette.dim)
+                                            .size(11.0),
                                     );
-                                    for ioc in group.iter().take(300) {
+                                    for &idx in rows {
+                                        let Some(ioc) = d.iocs.get(idx) else {
+                                            continue;
+                                        };
                                         let key = (ioc.offset, ioc.kind);
                                         let shown = if ioc_defang {
                                             defang(&ioc.value)
@@ -2470,6 +2763,16 @@ impl eframe::App for HexedApp {
                                             }
                                         });
                                     }
+                                }
+                                ui.add_space(2.0);
+                                if d.ioc_view.visible == 0 {
+                                    ui.weak("No indicators match the filter.");
+                                } else {
+                                    ui.weak(format!(
+                                        "{} shown / {ioc_count} total{}",
+                                        d.ioc_view.listed,
+                                        if d.ioc_view.capped() { " (capped)" } else { "" }
+                                    ));
                                 }
                             }
                         }
@@ -3644,6 +3947,8 @@ impl eframe::App for HexedApp {
         self.replace_query = replace_query.clone();
         self.bookmark_name = bookmark_name;
         self.strings_filter = strings_filter;
+        self.ioc_filter = ioc_filter;
+        self.ioc_kinds_hidden = ioc_kinds_hidden;
         if let Some(d) = self.docs.get_mut(a) {
             d.yara_string_offsets = yara_string_offsets;
             d.yara_ioc_keys = yara_ioc_keys;
@@ -3652,11 +3957,23 @@ impl eframe::App for HexedApp {
         self.yara_has_context = yara_has_context;
         self.disasm_bits = disasm_bits;
         self.bytes_per_row = bytes_per_row;
-        if view_mode != self.view {
-            if self.view == ViewMode::Text {
-                self.commit_text(self.active); // leaving text view: flush edits
+        let requested_view = view_mode;
+        // The toggle widget only writes the local, so a difference from
+        // `self.view` here means the user clicked it. The size fallback below
+        // runs afterwards and must never reach the stored preference, or one
+        // oversized file would silently reset the startup view to Hex.
+        if requested_view != self.view {
+            self.view_pref = requested_view;
+            save_view(requested_view);
+        }
+        if let Some(len) = self.docs.get(a).map(|d| d.buffer.len()) {
+            view_mode = view_mode_for_file_len(view_mode, len);
+            if requested_view != view_mode {
+                self.status = text_view_fallback_status(len);
             }
-            save_view(view_mode);
+        }
+        if view_mode != self.view && self.view == ViewMode::Text {
+            self.commit_text(self.active); // leaving text view: flush edits
         }
         self.view = view_mode;
         self.insert_count = insert_count;
@@ -4131,6 +4448,12 @@ impl eframe::App for HexedApp {
                         }
                         ui.heading("Hexed");
                         ui.label("hex editor & malware-triage tool");
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Created by Chi-en (Ashley) Shen")
+                                .weak()
+                                .size(11.0),
+                        );
                         ui.add_space(8.0);
                         if ui.button("Export icon as PNG…").clicked() {
                             export_icon = true;
@@ -4197,12 +4520,28 @@ impl eframe::App for HexedApp {
             }
         }
 
-        // ---- copy all IOCs to the clipboard ----
-        if let Some(defanged) = copy_iocs {
+        // ---- copy IOCs to the clipboard ----
+        // Two scopes, matching the two buttons. Neither consults the panel's
+        // filter: "Copy" is driven by the checkboxes and "Copy all" means all,
+        // so the clipboard always matches what the button label promises.
+        if let Some((scope, defanged)) = copy_iocs {
             if let Some(d) = self.docs.get(a) {
                 let mut s = String::new();
+                let mut copied = 0usize;
                 for kind in IOC_KINDS {
-                    let group: Vec<&Ioc> = d.iocs.iter().filter(|i| i.kind == *kind).collect();
+                    let group: Vec<&Ioc> = d
+                        .iocs
+                        .iter()
+                        .filter(|i| {
+                            i.kind == *kind
+                                && match scope {
+                                    IocCopy::Selected => {
+                                        d.yara_ioc_keys.contains(&(i.offset, i.kind))
+                                    }
+                                    IocCopy::All => true,
+                                }
+                        })
+                        .collect();
                     if group.is_empty() {
                         continue;
                     }
@@ -4215,13 +4554,22 @@ impl eframe::App for HexedApp {
                         };
                         s.push_str(&v);
                         s.push('\n');
+                        copied += 1;
                     }
                     s.push('\n');
                 }
                 if !s.is_empty() {
                     ctx.copy_text(s);
-                    self.status = "IOCs copied to clipboard".to_string();
-                    self.copy_flash_id = "iocs";
+                    self.status = match scope {
+                        IocCopy::Selected => {
+                            format!("{copied} selected IOCs copied to clipboard")
+                        }
+                        IocCopy::All => format!("{copied} IOCs copied to clipboard"),
+                    };
+                    self.copy_flash_id = match scope {
+                        IocCopy::Selected => "iocs_sel",
+                        IocCopy::All => "iocs_all",
+                    };
                     self.copy_flash_until = now + 1.2;
                 }
             }
@@ -5042,7 +5390,6 @@ impl HexedApp {
     /// undoable change when the field loses focus (or on save). Binary
     /// (non-UTF-8) or large files are read-only to avoid corruption / lag.
     fn draw_text(&mut self, ui: &mut egui::Ui) -> (Option<SelUpdate>, Option<(usize, Vec<u8>)>) {
-        const EDIT_LIMIT: usize = 1024 * 1024;
         let active = self.active;
         let (len, editable) = match self.docs.get(active) {
             None => {
@@ -5056,14 +5403,8 @@ impl HexedApp {
         // An empty buffer is valid UTF-8, so it falls through to the editor
         // below rather than dead-ending on a placeholder — that is the point of
         // File > New: a blank tab you can immediately type into.
-        if len > EDIT_LIMIT {
-            ui.label(
-                egui::RichText::new(format!(
-                    "File is {:.1} MB — too large for the text view; use the Hex view.",
-                    len as f64 / (1024.0 * 1024.0)
-                ))
-                .weak(),
-            );
+        if len > TEXT_VIEW_LIMIT {
+            ui.label(egui::RichText::new(text_view_too_large_msg(len)).weak());
             return (None, None);
         }
         // Rebuild the text buffer from bytes when the buffer changed under us
@@ -6263,5 +6604,285 @@ rule pe_template {
         empty.goto(usize::MAX, usize::MAX);
         assert_eq!(empty.selection_range(), None);
         assert_eq!(empty.text_reveal, None);
+    }
+}
+
+#[cfg(test)]
+mod human_size_tests {
+    use super::{human_size, TEXT_VIEW_LIMIT};
+
+    #[test]
+    fn singular_and_plural_bytes() {
+        assert_eq!(human_size(0), "0 bytes");
+        assert_eq!(human_size(1), "1 byte");
+        assert_eq!(human_size(2), "2 bytes");
+        assert_eq!(human_size(1023), "1023 bytes");
+    }
+
+    #[test]
+    fn unit_boundaries_step_exactly_at_1024() {
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1024 * 1024 - 1), "1024.0 KB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    /// The whole point of the message: it must name the limit, and the limit
+    /// must read as a round "1.0 MB" rather than something like "1048576 bytes".
+    #[test]
+    fn the_text_view_limit_renders_as_a_round_figure() {
+        assert_eq!(human_size(TEXT_VIEW_LIMIT), "1.0 MB");
+    }
+
+    #[test]
+    fn large_and_extreme_values_do_not_panic() {
+        assert_eq!(human_size(4 * 1024 * 1024), "4.0 MB");
+        assert_eq!(human_size(20 * 1024 * 1024), "20.0 MB");
+        // usize::MAX must format, not overflow or panic.
+        let s = human_size(usize::MAX);
+        assert!(s.ends_with(" GB"), "unexpected unit: {s}");
+    }
+}
+
+#[cfg(test)]
+mod text_view_notice_tests {
+    use super::{text_view_too_large_msg, TEXT_VIEW_LIMIT};
+
+    /// The regression this whole change exists for: the notice must name the
+    /// actual limit. Quoting only the file's size is what made a 3.2 MB file
+    /// look like proof of a "3 MB ceiling".
+    #[test]
+    fn names_the_limit_not_just_the_file_size() {
+        let msg = text_view_too_large_msg(4 * 1024 * 1024);
+        assert!(msg.contains("1.0 MB"), "must state the limit: {msg}");
+        assert!(msg.contains("4.0 MB"), "must state the file size: {msg}");
+    }
+
+    /// A blank-looking pane reads as a failed open, so the notice has to say
+    /// the file loaded and point at the view that can show it.
+    #[test]
+    fn says_the_file_loaded_and_where_to_read_it() {
+        let msg = text_view_too_large_msg(20 * 1024 * 1024);
+        assert!(msg.contains("fully loaded"), "{msg}");
+        assert!(msg.contains("Hex view"), "{msg}");
+    }
+
+    /// The limit in the text is derived from the const, so the two cannot drift
+    /// apart the way the old hardcoded phrasing could.
+    #[test]
+    fn limit_in_text_tracks_the_const() {
+        let msg = text_view_too_large_msg(TEXT_VIEW_LIMIT + 1);
+        assert!(msg.contains(&super::human_size(TEXT_VIEW_LIMIT)), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod view_mode_tests {
+    use super::{
+        text_view_fallback_status, view_from_str, view_mode_for_file_len, view_to_str, ViewMode,
+        DEFAULT_VIEW_MODE, TEXT_VIEW_LIMIT,
+    };
+
+    #[test]
+    fn hex_is_the_startup_default() {
+        assert_eq!(DEFAULT_VIEW_MODE, ViewMode::Hex);
+    }
+
+    #[test]
+    fn stored_view_round_trips() {
+        for v in [ViewMode::Hex, ViewMode::Text] {
+            assert_eq!(view_from_str(view_to_str(v)), v, "round trip for {v:?}");
+        }
+    }
+
+    #[test]
+    fn stored_view_tolerates_trailing_whitespace() {
+        // Nothing writes a newline today, but a hand-edited file will have one.
+        assert_eq!(view_from_str("text\n"), ViewMode::Text);
+        assert_eq!(view_from_str("  hex  "), ViewMode::Hex);
+    }
+
+    #[test]
+    fn unrecognised_stored_view_falls_back_to_the_default() {
+        // A truncated write or a value from a future build must not decide the
+        // startup view by accident.
+        for junk in ["", "  ", "Text", "grid", "\u{0}", "hexx"] {
+            assert_eq!(view_from_str(junk), DEFAULT_VIEW_MODE, "junk {junk:?}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_file_does_not_move_the_stored_preference() {
+        // The fallback is per-file: the preference stays Text, so the next file
+        // under the limit opens in Text again.
+        let pref = ViewMode::Text;
+        assert_eq!(
+            view_mode_for_file_len(pref, TEXT_VIEW_LIMIT + 1),
+            ViewMode::Hex
+        );
+        assert_eq!(view_mode_for_file_len(pref, 1024), ViewMode::Text);
+    }
+
+    #[test]
+    fn text_view_is_allowed_through_the_limit() {
+        assert_eq!(
+            view_mode_for_file_len(ViewMode::Text, TEXT_VIEW_LIMIT),
+            ViewMode::Text
+        );
+    }
+
+    #[test]
+    fn files_past_the_text_limit_use_hex_even_when_text_was_requested() {
+        assert_eq!(
+            view_mode_for_file_len(ViewMode::Text, TEXT_VIEW_LIMIT + 1),
+            ViewMode::Hex
+        );
+        assert_eq!(
+            view_mode_for_file_len(ViewMode::Text, usize::MAX),
+            ViewMode::Hex
+        );
+    }
+
+    #[test]
+    fn hex_requests_stay_hex_for_any_file_size() {
+        assert_eq!(
+            view_mode_for_file_len(ViewMode::Hex, TEXT_VIEW_LIMIT + 1),
+            ViewMode::Hex
+        );
+    }
+
+    #[test]
+    fn fallback_status_says_hex_is_being_shown() {
+        let msg = text_view_fallback_status(TEXT_VIEW_LIMIT + 1);
+        assert!(msg.contains("too large for the Text view"), "{msg}");
+        assert!(msg.contains("showing Hex"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod ioc_filter_tests {
+    use super::{ioc_slot, IocView, IOC_KINDS, IOC_ROWS_PER_KIND};
+    use hexed_core::{Ioc, IocKind, StringKind};
+
+    fn ioc(kind: IocKind, value: &str) -> Ioc {
+        Ioc {
+            kind,
+            value: value.to_string(),
+            encoding: StringKind::Ascii,
+            offset: 0,
+            byte_len: value.len(),
+        }
+    }
+
+    fn hidden(kinds: &[IocKind]) -> std::collections::BTreeSet<IocKind> {
+        kinds.iter().copied().collect()
+    }
+
+    fn view(iocs: &[Ioc], query: &str, hide: &[IocKind]) -> IocView {
+        let mut v = IocView::default();
+        v.refresh(iocs, query, &hidden(hide));
+        v
+    }
+
+    #[test]
+    fn ioc_slot_matches_kind_order() {
+        // The view buckets by `ioc_slot` but the panel walks `IOC_KINDS`, so a
+        // divergence would silently file indicators under the wrong heading.
+        for (i, kind) in IOC_KINDS.iter().enumerate() {
+            assert_eq!(ioc_slot(*kind), i, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn no_filter_lists_every_indicator() {
+        let iocs = vec![
+            ioc(IocKind::Url, "http://evil.example.com"),
+            ioc(IocKind::Domain, "evil.example.com"),
+            ioc(IocKind::Ipv4, "185.220.101.7"),
+        ];
+        let v = view(&iocs, "", &[]);
+        assert_eq!(v.visible, 3);
+        assert_eq!(v.listed, 3);
+        assert!(!v.capped());
+    }
+
+    #[test]
+    fn hidden_kinds_drop_rows_but_keep_their_chip_count() {
+        let iocs = vec![
+            ioc(IocKind::Url, "http://evil.example.com"),
+            ioc(IocKind::Domain, "evil.example.com"),
+        ];
+        let v = view(&iocs, "evil", &[IocKind::Domain]);
+        assert_eq!(v.visible, 1, "only the URL survives the kind toggle");
+        assert!(v.rows[ioc_slot(IocKind::Domain)].is_empty());
+        // The chip has to advertise what switching the kind back on would show.
+        assert_eq!(v.matched[ioc_slot(IocKind::Domain)], 1);
+        assert_eq!(v.totals[ioc_slot(IocKind::Domain)], 1);
+    }
+
+    #[test]
+    fn query_matches_the_defanged_form() {
+        let iocs = vec![ioc(IocKind::Domain, "evil.example.com")];
+        assert_eq!(view(&iocs, "evil[.]example", &[]).visible, 1);
+        assert_eq!(view(&iocs, "EVIL", &[]).visible, 1);
+        assert_eq!(view(&iocs, "goodware", &[]).visible, 0);
+    }
+
+    #[test]
+    fn rows_are_capped_per_kind_and_the_cap_is_reported() {
+        let n = IOC_ROWS_PER_KIND + 25;
+        let iocs: Vec<Ioc> = (0..n)
+            .map(|i| ioc(IocKind::Domain, &format!("host{i}.example.com")))
+            .collect();
+        let v = view(&iocs, "", &[]);
+        assert_eq!(v.visible, n, "every match is counted");
+        assert_eq!(v.listed, IOC_ROWS_PER_KIND, "but only the cap is listed");
+        assert!(v.capped(), "and the panel must be able to say so");
+    }
+
+    #[test]
+    fn refresh_rebuilds_when_the_filter_changes() {
+        let iocs = vec![
+            ioc(IocKind::Domain, "evil.example.com"),
+            ioc(IocKind::Domain, "good.example.com"),
+        ];
+        let mut v = IocView::default();
+        v.refresh(&iocs, "", &hidden(&[]));
+        assert_eq!(v.visible, 2);
+        v.refresh(&iocs, "evil", &hidden(&[]));
+        assert_eq!(v.visible, 1, "a changed query must invalidate the cache");
+        v.refresh(&iocs, "evil", &hidden(&[IocKind::Domain]));
+        assert_eq!(v.visible, 0, "a changed kind set must invalidate it too");
+        v.refresh(&iocs, "", &hidden(&[]));
+        assert_eq!(v.visible, 2, "and clearing the filter must bring it back");
+    }
+
+    #[test]
+    fn refresh_notices_a_rescan_that_changes_the_indicator_list() {
+        let one = vec![ioc(IocKind::Domain, "evil.example.com")];
+        let two = vec![
+            ioc(IocKind::Domain, "evil.example.com"),
+            ioc(IocKind::Domain, "evil.other.com"),
+        ];
+        let mut v = IocView::default();
+        v.refresh(&one, "evil", &hidden(&[]));
+        assert_eq!(v.visible, 1);
+        v.refresh(&two, "evil", &hidden(&[]));
+        assert_eq!(
+            v.visible, 2,
+            "a re-extracted list must invalidate the cache"
+        );
+    }
+
+    #[test]
+    fn rows_hold_indices_into_the_indicator_list() {
+        let iocs = vec![
+            ioc(IocKind::Domain, "good.example.com"),
+            ioc(IocKind::Domain, "evil.example.com"),
+        ];
+        let v = view(&iocs, "evil", &[]);
+        let rows = &v.rows[ioc_slot(IocKind::Domain)];
+        assert_eq!(rows.as_slice(), [1]);
+        assert_eq!(iocs[rows[0]].value, "evil.example.com");
     }
 }

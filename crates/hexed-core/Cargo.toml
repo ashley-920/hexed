@@ -3,6 +3,7 @@ name = "hexed-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 
 # UI-agnostic core (no egui / windowing deps) so the future .bt engine and a
 # headless CLI can reuse it. Crypto crates for the hashing module are fine.
