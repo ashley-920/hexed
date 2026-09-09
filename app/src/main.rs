@@ -637,8 +637,12 @@ struct HexedApp {
     disasm_bits: u32,
     /// Bytes shown per row in the hex grid (8/16/32).
     bytes_per_row: usize,
-    /// Central-pane view: hex grid or text.
+    /// Central-pane view actually being rendered. May sit at Hex while
+    /// `view_pref` is Text, when the open file is past [`TEXT_VIEW_LIMIT`].
     view: ViewMode,
+    /// The view the user last chose, persisted across launches. Only an explicit
+    /// toggle moves this; an oversized-file fallback never does.
+    view_pref: ViewMode,
     /// Number of zero bytes the "Insert" button adds.
     insert_count: usize,
     /// Byte width for the inspector's number-base converter (1/2/4/8).
@@ -680,6 +684,44 @@ fn load_theme() -> Theme {
 fn save_theme(t: Theme) {
     if let Some(p) = theme_file_path() {
         let _ = std::fs::write(p, t.id());
+    }
+}
+
+/// Remember the central-pane view mode across launches (`~/.hexed_view.txt`).
+///
+/// This stores the view the user last *chose*, not necessarily the one on screen:
+/// opening an oversized file drops the pane to Hex (see [`view_mode_for_file_len`])
+/// without disturbing the preference, so the next small file returns to Text.
+/// Parse the stored view mode. Anything unrecognised (a truncated write, a
+/// hand-edited file, a stale value from a future version) falls back to the
+/// default rather than failing the launch.
+fn view_from_str(s: &str) -> ViewMode {
+    match s.trim() {
+        "text" => ViewMode::Text,
+        "hex" => ViewMode::Hex,
+        _ => DEFAULT_VIEW_MODE,
+    }
+}
+
+fn view_to_str(v: ViewMode) -> &'static str {
+    match v {
+        ViewMode::Text => "text",
+        ViewMode::Hex => "hex",
+    }
+}
+
+fn load_view() -> ViewMode {
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".hexed_view.txt"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| view_from_str(&s))
+        .unwrap_or(DEFAULT_VIEW_MODE)
+}
+
+fn save_view(v: ViewMode) {
+    if let Some(h) = std::env::var_os("HOME") {
+        let p = std::path::PathBuf::from(h).join(".hexed_view.txt");
+        let _ = std::fs::write(p, view_to_str(v));
     }
 }
 
@@ -1149,7 +1191,8 @@ impl Default for HexedApp {
             vt: Vt::new(load_vt_enabled()),
             disasm_bits: 0,
             bytes_per_row: BYTES_PER_ROW,
-            view: DEFAULT_VIEW_MODE,
+            view: load_view(),
+            view_pref: load_view(),
             insert_count: 1,
             base_width: 4,
             base_edit: String::new(),
@@ -1187,7 +1230,7 @@ impl HexedApp {
                 // it loaded and analyzed fine. Drop to Hex so the bytes are there.
                 // Text remains available for smaller files, but large files
                 // always land in the byte-accurate view instead of a notice pane.
-                let requested_view = self.view;
+                let requested_view = self.view_pref;
                 self.view = view_mode_for_file_len(requested_view, len);
                 let fell_back = requested_view != self.view;
                 self.status = if fell_back {
@@ -3869,6 +3912,14 @@ impl eframe::App for HexedApp {
         self.disasm_bits = disasm_bits;
         self.bytes_per_row = bytes_per_row;
         let requested_view = view_mode;
+        // The toggle widget only writes the local, so a difference from
+        // `self.view` here means the user clicked it. The size fallback below
+        // runs afterwards and must never reach the stored preference, or one
+        // oversized file would silently reset the startup view to Hex.
+        if requested_view != self.view {
+            self.view_pref = requested_view;
+            save_view(requested_view);
+        }
         if let Some(len) = self.docs.get(a).map(|d| d.buffer.len()) {
             view_mode = view_mode_for_file_len(view_mode, len);
             if requested_view != view_mode {
@@ -6513,13 +6564,48 @@ mod text_view_notice_tests {
 #[cfg(test)]
 mod view_mode_tests {
     use super::{
-        text_view_fallback_status, view_mode_for_file_len, ViewMode, DEFAULT_VIEW_MODE,
-        TEXT_VIEW_LIMIT,
+        text_view_fallback_status, view_from_str, view_mode_for_file_len, view_to_str, ViewMode,
+        DEFAULT_VIEW_MODE, TEXT_VIEW_LIMIT,
     };
 
     #[test]
     fn hex_is_the_startup_default() {
         assert_eq!(DEFAULT_VIEW_MODE, ViewMode::Hex);
+    }
+
+    #[test]
+    fn stored_view_round_trips() {
+        for v in [ViewMode::Hex, ViewMode::Text] {
+            assert_eq!(view_from_str(view_to_str(v)), v, "round trip for {v:?}");
+        }
+    }
+
+    #[test]
+    fn stored_view_tolerates_trailing_whitespace() {
+        // Nothing writes a newline today, but a hand-edited file will have one.
+        assert_eq!(view_from_str("text\n"), ViewMode::Text);
+        assert_eq!(view_from_str("  hex  "), ViewMode::Hex);
+    }
+
+    #[test]
+    fn unrecognised_stored_view_falls_back_to_the_default() {
+        // A truncated write or a value from a future build must not decide the
+        // startup view by accident.
+        for junk in ["", "  ", "Text", "grid", "\u{0}", "hexx"] {
+            assert_eq!(view_from_str(junk), DEFAULT_VIEW_MODE, "junk {junk:?}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_file_does_not_move_the_stored_preference() {
+        // The fallback is per-file: the preference stays Text, so the next file
+        // under the limit opens in Text again.
+        let pref = ViewMode::Text;
+        assert_eq!(
+            view_mode_for_file_len(pref, TEXT_VIEW_LIMIT + 1),
+            ViewMode::Hex
+        );
+        assert_eq!(view_mode_for_file_len(pref, 1024), ViewMode::Text);
     }
 
     #[test]
