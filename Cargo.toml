@@ -6,7 +6,7 @@ members = ["crates/hexed-core", "crates/hexed-bt", "app"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["hexed contributors"]
+authors = ["Chi-en (Ashley) Shen"]
 
 [profile.release]
 opt-level = 3

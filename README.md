@@ -6,7 +6,7 @@
 
 **A hex editor built for threat analysts.** Written in Rust + [egui](https://github.com/emilk/egui).
 
-Open a suspicious file and hexed immediately works it up: it parses the PE, **extracts and defangs IOCs**, **flags dangerous imports** by capability, **finds embedded payloads and crypto constants**, and gives you a **one-click triage report** — all without leaving the byte view. It borrows good ideas from 010 Editor, ImHex, and HxD, but the workflow is tuned for *triage*: open → understand → pivot → write a rule.
+Open a suspicious file and hexed immediately works it up: it parses the PE, **extracts and defangs IOCs**, **flags dangerous imports** by capability, **finds embedded payloads and crypto constants**, and gives you a **one-click triage report** — all without leaving the byte view. Every part of it is shaped around what a threat or malware analyst actually does with a sample: open → understand → pivot → write a rule.
 
 > Defensive / research tool. It only ever **reads** the bytes you point it at — it never executes a sample.
 
@@ -78,7 +78,7 @@ Running the built‑in report over the bundled [`examples/demo_triage.bin`](exam
 
 **Viewing & navigation**
 - Virtualized hex + ASCII grid (opens multi‑hundred‑MB files instantly), byte‑value colour coding, **4 switchable themes**, and a launch splash
-- **Hex / Text view toggle** — flip the central pane between the hex grid and a **text view**, like 010 Editor. Both are **editable**: type hex digits (or ASCII) straight into the grid to overwrite bytes, or edit the file as **word‑wrapped, editable text** — changes commit back to the buffer as one undoable step. Non‑UTF‑8 files stay read‑only in text mode so binaries can't be mangled
+- **Hex / Text view toggle** — flip the central pane between the hex grid and a **text view**. Both are **editable**: type hex digits (or ASCII) straight into the grid to overwrite bytes, or edit the file as **word‑wrapped, editable text** — changes commit back to the buffer as one undoable step. Non‑UTF‑8 files stay read‑only in text mode so binaries can't be mangled
 - **Syntax highlighting in the text view** — the text view **auto‑detects the language** (by extension, else a content sniff) and colours it: JavaScript, PowerShell, VBScript, Python, shell, batch, PHP, C‑like, JSON, XML/HTML, Markdown, and **YARA** (hex byte‑patterns, regexes, and `$`/`#`/`@`/`!` string identifiers included) — handy for reading dropped scripts, configs, and your rule library. A **Syntax** picker lets you override the guess per file (e.g. force VBScript on a decoded `.vbe` saved as `.txt`). Built‑in and dependency‑free
 - **Tabs** — many files at once; each keeps its own selection, strings, hashes, search, and decode state; drag‑and‑drop to open
 - **Entropy strip** down the gutter (blue → red) to spot packed/encrypted regions at a glance
@@ -162,6 +162,10 @@ hexed/
 ├─ crates/hexed-bt/     # the 010-style .bt binary-template engine
 └─ app/                 # egui/eframe shell (thin; all logic lives in core)
 ```
+
+## Author
+
+Built by **Chi-en (Ashley) Shen** — [ashley.hacksbetweenus.com](https://ashley.hacksbetweenus.com/).
 
 ## License
 
