@@ -1468,8 +1468,17 @@ fn tokenize_markdown(src: &[u8], out: &mut Vec<Span>) {
             while i < n && src[i] != mark && src[i] != b'\n' {
                 i += 1;
             }
-            i += if double && i + 1 < n { 2 } else { 1 };
-            i = i.min(n);
+            // Consume the closing marker, but only what is really there. The
+            // scan also stops at a newline and at EOF, and stepping blindly over
+            // two bytes for a `**` that closed with one lands inside whatever
+            // follows — mid-codepoint if that is a multi-byte character, which
+            // then panics when the span is sliced out of the text.
+            if i < n && src[i] == mark {
+                i += 1;
+                if double && i < n && src[i] == mark {
+                    i += 1;
+                }
+            }
             let mut sp = Span::new(start, i, Tok::Attr);
             sp.italic = true;
             out.push(sp);
@@ -1770,6 +1779,22 @@ End Sub"#;
         assert_eq!(tok_of(src, Lang::Markdown, "`code`"), Some(Tok::Str));
         assert_eq!(tok_of(src, Lang::Markdown, "[t]"), Some(Tok::Link));
         assert_clean(src, Lang::Markdown);
+    }
+
+    #[test]
+    fn markdown_emphasis_stops_on_the_marker_it_finds() {
+        // A `**` opener closed by a single `*` must not step over the byte after
+        // it: when that byte begins a multi-byte character the span lands
+        // mid-codepoint, and slicing it panics.
+        let l = Lang::Markdown;
+        for src in ["**x*日", "**x*é", "__x_日", "**日*日", "**x*"] {
+            assert_clean(src, l);
+        }
+        // Well-formed emphasis still covers both markers.
+        assert_eq!(spans("**b** t", l)[0], (0, 5, Tok::Attr));
+        assert_eq!(spans("*i* t", l)[0], (0, 3, Tok::Attr));
+        // Unterminated emphasis stops at the line, not inside the next one.
+        assert_eq!(spans("*a\nb", l)[0], (0, 2, Tok::Attr));
     }
 
     #[test]
