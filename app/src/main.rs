@@ -5440,7 +5440,9 @@ impl HexedApp {
                     let current = d.text_lang_override.unwrap_or(detected);
                     egui::ComboBox::from_id_salt("text_lang_picker")
                         .selected_text(highlight::name(current))
-                        .height(360.0) // show every language without scrolling
+                        // Caps the dropdown's scroll area. The language list is
+                        // taller than this, so it scrolls.
+                        .height(360.0)
                         .show_ui(ui, |ui| {
                             let auto = format!("Auto · {}", highlight::name(detected));
                             if ui
